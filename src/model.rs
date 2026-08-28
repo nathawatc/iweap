@@ -5,6 +5,7 @@ use zeroize::Zeroize;
 use zvariant::Type;
 
 pub const MAX_SSID_BYTES: usize = 32;
+pub const MAX_EAP_IDENTITY_BYTES: usize = 253;
 pub const MAX_EAP_DEPTH: usize = 4;
 pub const MAX_EAP_LAYERS: usize = MAX_EAP_DEPTH + 1;
 pub const MAX_TEXT_BYTES: usize = 4096;
@@ -366,7 +367,11 @@ impl Profile {
     }
 
     fn validate_layer_fields(&self, layer: &EapLayer) -> Result<(), ValidationError> {
-        validate_optional_text(layer.identity.as_deref())?;
+        if layer.method.is_tunneled() {
+            validate_optional_text(layer.identity.as_deref())?;
+        } else {
+            validate_eap_identity(layer.identity.as_deref())?;
+        }
         if layer.method.is_sim_method() {
             if layer.identity.is_some()
                 || layer.password.is_some()
@@ -634,6 +639,14 @@ fn validate_optional_text(value: Option<&str>) -> Result<(), ValidationError> {
             return Err(ValidationError::MethodHasUnexpectedFields);
         }
         validate_text(value, MAX_TEXT_BYTES)?;
+    }
+    Ok(())
+}
+
+fn validate_eap_identity(value: Option<&str>) -> Result<(), ValidationError> {
+    validate_optional_text(value)?;
+    if value.is_some_and(|value| value.len() > MAX_EAP_IDENTITY_BYTES) {
+        return Err(ValidationError::TextTooLong);
     }
     Ok(())
 }
@@ -1245,6 +1258,12 @@ mod tests {
         assert_eq!(
             profile(vec![layer]).validate(),
             Err(ValidationError::PasswordConflict)
+        );
+
+        let layer = password_layer(EapMethod::Mschapv2, &"x".repeat(254), "secret");
+        assert_eq!(
+            profile(vec![layer]).validate(),
+            Err(ValidationError::TextTooLong)
         );
     }
 

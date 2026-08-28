@@ -7,12 +7,92 @@ use zbus::message::Header;
 
 pub struct InstallerService {
     installer: Arc<Mutex<Installer>>,
+    activity: ServiceActivity,
+}
+
+#[derive(Clone)]
+pub struct ServiceActivity {
+    state: Arc<Mutex<ActivityState>>,
+}
+
+struct ActivityState {
+    accepting: bool,
+    active_requests: usize,
+}
+
+struct RequestGuard {
+    activity: ServiceActivity,
 }
 
 impl InstallerService {
     pub fn new(installer: Installer) -> Self {
         Self {
             installer: Arc::new(Mutex::new(installer)),
+            activity: ServiceActivity {
+                state: Arc::new(Mutex::new(ActivityState {
+                    accepting: true,
+                    active_requests: 0,
+                })),
+            },
+        }
+    }
+
+    pub fn activity(&self) -> ServiceActivity {
+        self.activity.clone()
+    }
+
+    fn request_guard(&self) -> fdo::Result<RequestGuard> {
+        self.activity
+            .begin()
+            .ok_or_else(|| fdo::Error::Failed(String::from("service is shutting down")))
+    }
+}
+
+impl ServiceActivity {
+    fn begin(&self) -> Option<RequestGuard> {
+        let mut state = match self.state.lock() {
+            Ok(state) => state,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        if !state.accepting {
+            return None;
+        }
+        state.active_requests += 1;
+        Some(RequestGuard {
+            activity: self.clone(),
+        })
+    }
+
+    pub fn stop_if_idle(&self) -> bool {
+        let mut state = match self.state.lock() {
+            Ok(state) => state,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        if state.active_requests == 0 {
+            state.accepting = false;
+            true
+        } else {
+            false
+        }
+    }
+
+    #[cfg(test)]
+    fn active_requests(&self) -> usize {
+        match self.state.lock() {
+            Ok(state) => state.active_requests,
+            Err(poisoned) => poisoned.into_inner().active_requests,
+        }
+    }
+}
+
+impl Drop for RequestGuard {
+    fn drop(&mut self) {
+        let mut state = match self.activity.state.lock() {
+            Ok(state) => state,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        if state.active_requests > 0 {
+            state.active_requests -= 1;
         }
     }
 }
@@ -20,6 +100,7 @@ impl InstallerService {
 #[zbus::interface(name = "org.codeberg.iweap1.ProfileInstaller")]
 impl InstallerService {
     async fn inspect_profile(&self, ssid: &str) -> fdo::Result<ProfileInspection> {
+        let _request = self.request_guard()?;
         let installer = self
             .installer
             .lock()
@@ -33,6 +114,7 @@ impl InstallerService {
         request: InstallRequest,
         #[zbus(header)] header: Header<'_>,
     ) -> fdo::Result<String> {
+        let _request = self.request_guard()?;
         let sender = header
             .sender()
             .ok_or_else(|| fdo::Error::AccessDenied(String::from("missing D-Bus caller identity")))?
@@ -117,5 +199,18 @@ mod tests {
             validate_request(invalid),
             Err(fdo::Error::InvalidArgs(_))
         ));
+    }
+
+    #[test]
+    fn idle_shutdown_rejects_new_requests_after_active_work_finishes() {
+        let service = InstallerService::new(Installer::system());
+        let activity = service.activity();
+        let request = activity.begin().expect("admit request");
+        assert_eq!(activity.active_requests(), 1);
+        assert!(!activity.stop_if_idle());
+        drop(request);
+        assert_eq!(activity.active_requests(), 0);
+        assert!(activity.stop_if_idle());
+        assert!(activity.begin().is_none());
     }
 }

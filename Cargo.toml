@@ -20,9 +20,14 @@ name = "iweap-service"
 path = "src/bin/iweap-service.rs"
 
 [dependencies]
+async-io = "2.6"
+futures-lite = { version = "2.6", default-features = false, features = ["std"] }
 rustix = { version = "1.1", default-features = false, features = ["std", "fs", "process", "termios"] }
 serde = { version = "1", features = ["derive"] }
 signal-hook = { version = "0.4", default-features = false, features = ["iterator"] }
 zbus = { version = "5.19", features = ["blocking-api"] }
 zvariant = "5.15"
 zeroize = "1"
+
+[dev-dependencies]
+libc = "0.2"

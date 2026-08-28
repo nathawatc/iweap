@@ -43,7 +43,16 @@ systemctl daemon-reload
 ```
 
 The system bus must have a Polkit authority and an authentication agent for
-the active user session.
+the active user session. The unit is D-Bus activated; do not enable it as a
+boot service. `StateDirectory=iwd` creates `/var/lib/iwd` before the strict
+service namespace is built, keeps it persistent, and sets the directory mode
+to `0700`, matching IWD and the installer. The service runs as root because it
+must write IWD state; its unit bounds capabilities and writable paths. When an
+existing state directory has a different owner or group, systemd recursively
+aligns ownership below it, so deployment assumes IWD's normal root-owned
+`/var/lib/iwd`. Existing root-owned contents are not otherwise reset. The
+service exits after 60 seconds without D-Bus activity and is reactivated on a
+later request.
 
 ## Use
 

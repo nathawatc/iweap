@@ -187,15 +187,15 @@ impl Installer {
         ) {
             Ok(fd) => fd,
             Err(error) if error == rustix::io::Errno::NOENT && create => {
-                mkdirat(&parent_fd, name, directory_mode())
-                    .or_else(|mkdir_error| {
-                        if mkdir_error == rustix::io::Errno::EXIST {
-                            Ok(())
-                        } else {
-                            Err(mkdir_error)
-                        }
-                    })
-                    .map_err(|error| io_error("create state directory", error))?;
+                let created = match mkdirat(&parent_fd, name, directory_mode()) {
+                    Ok(()) => true,
+                    Err(error) if error == rustix::io::Errno::EXIST => false,
+                    Err(error) => return Err(io_error("create state directory", error)),
+                };
+                if created {
+                    fsync(&parent_fd)
+                        .map_err(|error| io_error("sync state parent directory", error))?;
+                }
                 openat(
                     &parent_fd,
                     name,
@@ -368,6 +368,7 @@ mod tests {
     use super::*;
     use crate::model::{EapLayer, EapMethod, Secret};
     use std::os::unix::fs::{PermissionsExt, symlink};
+    use std::os::unix::net::UnixListener;
     use std::sync::atomic::{AtomicU64, Ordering};
 
     static FIXTURE_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -478,6 +479,38 @@ mod tests {
             .expect("restrict state directory");
         let filename = profile("secret").profile_filename().expect("filename");
         symlink("missing-target", fixture.root.join(filename)).expect("create symlink");
+        let installer = Installer::for_test(fixture.root.clone());
+
+        assert!(matches!(
+            installer.inspect("Office Wi-Fi"),
+            Err(InstallError::UnexpectedDestination)
+        ));
+    }
+
+    #[test]
+    fn directory_destination_is_never_accepted() {
+        let fixture = Fixture::new();
+        fs::create_dir(&fixture.root).expect("create state directory");
+        fs::set_permissions(&fixture.root, fs::Permissions::from_mode(0o700))
+            .expect("restrict state directory");
+        let filename = profile("secret").profile_filename().expect("filename");
+        fs::create_dir(fixture.root.join(filename)).expect("create directory destination");
+        let installer = Installer::for_test(fixture.root.clone());
+
+        assert!(matches!(
+            installer.inspect("Office Wi-Fi"),
+            Err(InstallError::UnexpectedDestination)
+        ));
+    }
+
+    #[test]
+    fn special_destination_is_never_accepted() {
+        let fixture = Fixture::new();
+        fs::create_dir(&fixture.root).expect("create state directory");
+        fs::set_permissions(&fixture.root, fs::Permissions::from_mode(0o700))
+            .expect("restrict state directory");
+        let filename = profile("secret").profile_filename().expect("filename");
+        let _socket = UnixListener::bind(fixture.root.join(filename)).expect("create socket");
         let installer = Installer::for_test(fixture.root.clone());
 
         assert!(matches!(

@@ -34,11 +34,23 @@ impl std::error::Error for InputError {}
 
 pub struct Input<R> {
     reader: R,
+    signals: Option<SignalManager>,
 }
 
 impl<R: BufRead> Input<R> {
+    #[cfg(test)]
     pub fn new(reader: R) -> Self {
-        Self { reader }
+        Self {
+            reader,
+            signals: None,
+        }
+    }
+
+    pub fn with_signals(reader: R, signals: SignalManager) -> Self {
+        Self {
+            reader,
+            signals: Some(signals),
+        }
     }
 
     pub fn line(&mut self, prompt: &str) -> Result<String, InputError> {
@@ -117,7 +129,11 @@ impl<R: BufRead> Input<R> {
 
     pub fn secret(&mut self, prompt: &str) -> Result<Secret, InputError> {
         print_prompt(prompt)?;
-        read_secret()
+        let signals = self
+            .signals
+            .as_ref()
+            .ok_or_else(|| InputError::Terminal(String::from("signal manager is not installed")))?;
+        read_secret(signals)
     }
 
     pub fn secret_required(&mut self, prompt: &str) -> Result<Secret, InputError> {
@@ -141,6 +157,66 @@ enum SecretEvent {
     Signal(i32),
 }
 
+pub struct SignalManager {
+    active_secret: std::sync::Arc<std::sync::Mutex<Option<mpsc::Sender<SecretEvent>>>>,
+}
+
+impl SignalManager {
+    pub fn install() -> Result<Self, InputError> {
+        let mut signals = Signals::new([SIGHUP, SIGINT, SIGTERM]).map_err(InputError::Signal)?;
+        let active_secret =
+            std::sync::Arc::new(std::sync::Mutex::new(None::<mpsc::Sender<SecretEvent>>));
+        let listener_active = std::sync::Arc::clone(&active_secret);
+        thread::spawn(move || {
+            for signal in signals.forever() {
+                let active = match listener_active.lock() {
+                    Ok(active) => active,
+                    Err(poisoned) => poisoned.into_inner(),
+                };
+                if let Some(sender) = active.as_ref() {
+                    let _ = sender.send(SecretEvent::Signal(signal));
+                } else {
+                    std::process::exit(128 + signal);
+                }
+            }
+        });
+        Ok(Self { active_secret })
+    }
+
+    fn begin_secret(
+        &self,
+        sender: mpsc::Sender<SecretEvent>,
+    ) -> Result<SecretSignalScope, InputError> {
+        let mut active = match self.active_secret.lock() {
+            Ok(active) => active,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        if active.is_some() {
+            return Err(InputError::Terminal(String::from(
+                "secret input is already active",
+            )));
+        }
+        *active = Some(sender);
+        Ok(SecretSignalScope {
+            active_secret: std::sync::Arc::clone(&self.active_secret),
+        })
+    }
+}
+
+struct SecretSignalScope {
+    active_secret: std::sync::Arc<std::sync::Mutex<Option<mpsc::Sender<SecretEvent>>>>,
+}
+
+impl Drop for SecretSignalScope {
+    fn drop(&mut self) {
+        let mut active = match self.active_secret.lock() {
+            Ok(active) => active,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        active.take();
+    }
+}
+
 struct TerminalGuard {
     tty: File,
     original: rustix::termios::Termios,
@@ -152,8 +228,10 @@ impl TerminalGuard {
         let original = tcgetattr(&tty).map_err(|error| InputError::Terminal(error.to_string()))?;
         let mut silent = original.clone();
         silent.local_modes.remove(LocalModes::ECHO);
-        tcsetattr(&tty, OptionalActions::Now, &silent)
-            .map_err(|error| InputError::Terminal(error.to_string()))?;
+        if let Err(error) = tcsetattr(&tty, OptionalActions::Now, &silent) {
+            let _ = tcsetattr(&tty, OptionalActions::Now, &original);
+            return Err(InputError::Terminal(error.to_string()));
+        }
         Ok(Self {
             tty,
             original,
@@ -177,20 +255,18 @@ impl Drop for TerminalGuard {
     }
 }
 
-fn read_secret() -> Result<Secret, InputError> {
+fn read_secret(signals: &SignalManager) -> Result<Secret, InputError> {
     let tty = OpenOptions::new()
         .read(true)
         .open("/dev/tty")
         .map_err(|error| InputError::Terminal(error.to_string()))?;
-    let signal_set = Signals::new([SIGHUP, SIGINT, SIGTERM]).map_err(InputError::Signal)?;
-    let signal_handle = signal_set.handle();
-    let mut guard = TerminalGuard::new(tty).inspect_err(|_| signal_handle.close())?;
+    let (sender, receiver) = mpsc::channel();
+    let signal_scope = signals.begin_secret(sender.clone())?;
+    let mut guard = TerminalGuard::new(tty)?;
     let read_tty = guard
         .tty
         .try_clone()
-        .inspect_err(|_| signal_handle.close())
         .map_err(|error| InputError::Terminal(error.to_string()))?;
-    let (sender, receiver) = mpsc::channel();
     let reader_sender = sender.clone();
     let reader = thread::spawn(move || {
         let mut reader = io::BufReader::new(read_tty);
@@ -209,30 +285,25 @@ fn read_secret() -> Result<Secret, InputError> {
         });
         let _ = reader_sender.send(SecretEvent::Read(result.and_then(|value| value)));
     });
-    let signal_sender = sender;
-    let signal_thread = thread::spawn(move || {
-        let mut signals = signal_set;
-        if let Some(signal) = signals.forever().next() {
-            let _ = signal_sender.send(SecretEvent::Signal(signal));
-        }
-    });
 
-    let event = receiver.recv().map_err(|_| {
-        signal_handle.close();
-        InputError::Terminal(String::from("secret reader stopped unexpectedly"))
-    });
-    signal_handle.close();
-    let _ = signal_thread.join();
+    let event = receiver
+        .recv()
+        .map_err(|_| InputError::Terminal(String::from("secret reader stopped unexpectedly")))?;
 
-    match event? {
+    match event {
         SecretEvent::Read(result) => {
             let _ = reader.join();
             guard.restore()?;
+            drop(signal_scope);
             eprintln!();
+            if let Some(SecretEvent::Signal(signal)) = receiver.try_iter().next() {
+                return Err(InputError::Interrupted(signal));
+            }
             result.map_err(InputError::Io)
         }
         SecretEvent::Signal(signal) => {
             guard.restore()?;
+            drop(signal_scope);
             eprintln!();
             drop(reader);
             Err(InputError::Interrupted(signal))

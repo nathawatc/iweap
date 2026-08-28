@@ -1,6 +1,6 @@
 mod input;
 
-use input::{Input, InputError};
+use input::{Input, InputError, SignalManager};
 use iweap::model::MAX_EAP_DEPTH;
 use iweap::{
     EapLayer, EapMethod, IWD_DIRECTORY, InstallRequest, Profile, Secret, TlsClientCredentials,
@@ -54,8 +54,12 @@ struct Options {
 
 fn main() {
     if let Err(error) = run() {
+        let exit_code = match &error {
+            AppError::Input(InputError::Interrupted(signal)) => 128 + signal,
+            _ => 1,
+        };
         eprintln!("iweap: {error}");
-        std::process::exit(1);
+        std::process::exit(exit_code);
     }
 }
 
@@ -63,8 +67,9 @@ fn run() -> Result<(), AppError> {
     let Some(options) = parse_args()? else {
         return Ok(());
     };
+    let signals = SignalManager::install()?;
     let stdin = io::stdin();
-    let mut input = Input::new(stdin.lock());
+    let mut input = Input::with_signals(stdin.lock(), signals);
 
     let ssid = loop {
         let value = input.required("SSID: ")?;
