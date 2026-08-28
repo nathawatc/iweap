@@ -1,0 +1,21 @@
+[Unit]
+Description=iweap IWD 802.1X profile installer
+Requires=dbus.socket
+After=dbus.socket polkit.service
+
+[Service]
+Type=dbus
+BusName=org.codeberg.iweap
+ExecStart=/usr/lib/iweap/iweap-service
+User=root
+Group=root
+UMask=0077
+ProtectSystem=full
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+RestrictAddressFamilies=AF_UNIX
+ReadWritePaths=/var/lib/iwd
+
+[Install]
+WantedBy=multi-user.target

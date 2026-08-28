@@ -1,0 +1,28 @@
+[package]
+name = "iweap"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.87"
+description = "Secure interactive IWD 802.1X profile generator"
+license-file = "LICENSE"
+default-run = "iweap"
+
+[lib]
+name = "iweap"
+path = "src/lib.rs"
+
+[[bin]]
+name = "iweap"
+path = "src/main.rs"
+
+[[bin]]
+name = "iweap-service"
+path = "src/bin/iweap-service.rs"
+
+[dependencies]
+rustix = { version = "1.1", default-features = false, features = ["std", "fs", "process", "termios"] }
+serde = { version = "1", features = ["derive"] }
+signal-hook = { version = "0.4", default-features = false, features = ["iterator"] }
+zbus = { version = "5.19", features = ["blocking-api"] }
+zvariant = "5.15"
+zeroize = "1"
