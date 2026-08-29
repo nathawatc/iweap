@@ -188,13 +188,58 @@ fn select_credential_handling<R: BufRead>(input: &mut Input<R>) -> Result<bool, 
     }
 }
 
-fn select_ttls_phase2_method<R: BufRead>(input: &mut Input<R>) -> Result<EapMethod, AppError> {
-    let methods = EapMethod::TTLS_TUNNELED
-        .iter()
-        .chain(EapMethod::INNER)
-        .copied()
-        .collect::<Vec<_>>();
-    select_method(input, "TTLS phase-2 method", &methods)
+fn select_compatible_method<R: BufRead>(
+    input: &mut Input<R>,
+    title: &str,
+    methods: impl IntoIterator<Item = EapMethod>,
+    existing_layers: &[EapLayer],
+    store_credentials: bool,
+) -> Result<EapMethod, AppError> {
+    let methods: Vec<EapMethod> = methods
+        .into_iter()
+        .filter(|method| {
+            iweap::model::is_eap_method_supported_for_layers(
+                *method,
+                existing_layers,
+                store_credentials,
+            )
+        })
+        .collect();
+    if methods.is_empty() {
+        return Err(ValidationError::SettingPrefixTooLong.into());
+    }
+    select_method(input, title, &methods)
+}
+
+fn select_inner_eap_method<R: BufRead>(
+    input: &mut Input<R>,
+    existing_layers: &[EapLayer],
+    store_credentials: bool,
+) -> Result<EapMethod, AppError> {
+    select_compatible_method(
+        input,
+        "Inner EAP method",
+        EapMethod::INNER.iter().copied(),
+        existing_layers,
+        store_credentials,
+    )
+}
+
+fn select_ttls_phase2_method<R: BufRead>(
+    input: &mut Input<R>,
+    existing_layers: &[EapLayer],
+    store_credentials: bool,
+) -> Result<EapMethod, AppError> {
+    select_compatible_method(
+        input,
+        "TTLS phase-2 method",
+        EapMethod::TTLS_TUNNELED
+            .iter()
+            .chain(EapMethod::INNER)
+            .copied(),
+        existing_layers,
+        store_credentials,
+    )
 }
 
 fn configure_layer<R: BufRead>(
@@ -230,11 +275,11 @@ fn configure_layer<R: BufRead>(
 
     match method {
         EapMethod::Peap => {
-            let child = select_method(input, "Inner EAP method", EapMethod::INNER)?;
+            let child = select_inner_eap_method(input, layers, store_credentials)?;
             configure_layer(input, layers, child, depth + 1, false, store_credentials)?;
         }
         EapMethod::Ttls => {
-            let child = select_ttls_phase2_method(input)?;
+            let child = select_ttls_phase2_method(input, layers, store_credentials)?;
             configure_layer(input, layers, child, depth + 1, false, store_credentials)?;
         }
         _ => {}
@@ -474,8 +519,55 @@ mod tests {
 
         let mut input = Input::new(Cursor::new(b"15\n"));
         assert_eq!(
-            select_ttls_phase2_method(&mut input).expect("select TTLS method"),
+            select_ttls_phase2_method(&mut input, &[EapLayer::new(EapMethod::Ttls)], false,)
+                .expect("select TTLS method"),
             EapMethod::WfaTls
+        );
+    }
+
+    fn peap_layer() -> EapLayer {
+        let mut layer = EapLayer::new(EapMethod::Peap);
+        layer.tls = Some(TlsConfig {
+            ca_cert: None,
+            server_domain_mask: None,
+            fast_reauthentication: None,
+            client: TlsClientCredentials::None,
+            client_key_passphrase: None,
+        });
+        layer
+    }
+
+    fn nested_peap_layers(count: usize) -> Vec<EapLayer> {
+        (0..count).map(|_| peap_layer()).collect()
+    }
+
+    #[test]
+    fn cli_filters_tls_methods_at_prefix_boundary() {
+        let existing_layers = nested_peap_layers(2);
+        let mut input = Input::new(Cursor::new(b"9\n"));
+        assert_eq!(
+            select_inner_eap_method(&mut input, &existing_layers, false)
+                .expect("select inner method"),
+            EapMethod::Ttls
+        );
+    }
+
+    #[test]
+    fn cli_uses_known_credential_mode_for_mschapv2_selection() {
+        let existing_layers = nested_peap_layers(4);
+
+        let mut input = Input::new(Cursor::new(b"3\n"));
+        assert_eq!(
+            select_inner_eap_method(&mut input, &existing_layers, false)
+                .expect("agent-compatible method"),
+            EapMethod::Mschapv2
+        );
+
+        let mut input = Input::new(Cursor::new(b"3\n"));
+        assert_eq!(
+            select_inner_eap_method(&mut input, &existing_layers, true)
+                .expect("stored-compatible method"),
+            EapMethod::Pwd
         );
     }
 
