@@ -5,10 +5,11 @@ Interactive Rust generator and installer for IWD 802.1X profiles.
 ## Architecture
 
 `iweap` runs as the invoking user. It builds and previews a typed EAP model,
-then sends `InstallProfile` over the system D-Bus. `iweap-service` runs as
-root, checks the caller with Polkit action
-`org.codeberg.iweap.install-profile`, validates the request again, and writes
-only `/var/lib/iwd`.
+then sends `InstallProfile` over the system D-Bus. D-Bus activation is fail-closed:
+direct D-Bus execution of the root service is disabled, and systemd must launch
+`iweap-service` through its hardened unit. The service checks the caller with
+Polkit action `org.codeberg.iweap.install-profile`, validates the request again,
+and writes only `/var/lib/iwd`.
 
 No `sudo`, `doas`, `pkexec`, `run0`, shell command, or setuid helper is used.
 Read-only profile inspection does not require authorization. Installation does.
@@ -44,8 +45,10 @@ systemctl daemon-reload
 
 The system bus must have a Polkit authority and an authentication agent for
 the active user session. The unit is D-Bus activated; do not enable it as a
-boot service. `StateDirectory=iwd` creates `/var/lib/iwd` before the strict
-service namespace is built, keeps it persistent, and sets the directory mode
+boot service. Its D-Bus activation entry fails closed and delegates launch to
+systemd, so the root service always receives the unit sandbox. `StateDirectory=iwd`
+creates `/var/lib/iwd` before the strict service namespace is built, keeps it
+persistent, and sets the directory mode
 to `0700`, matching IWD and the installer. The service runs as root because it
 must write IWD state; its unit bounds capabilities and writable paths. When an
 existing state directory has a different owner or group, systemd recursively
@@ -78,8 +81,12 @@ When selected, IWD-compatible profile secrets remain plaintext at rest in
 `/var/lib/iwd`; the root-owned directory is mode `0700` and each profile is
 root-owned mode `0600`.
 
-Certificate and key paths are validated as absolute existing regular files and
-are referenced, not copied. Installation uses descriptor-relative operations,
+Certificate and key paths are validated as absolute existing regular files
+visible inside the systemd service namespace and are referenced, not copied.
+Paths under `/home`, `/root`, `/run/user`, `/tmp`, `/var/tmp`, `/dev`, and
+`/usr/lib/modules`, plus `/proc/kallsyms` and `/proc/kcore`, are rejected
+because the unit hides or privatizes them. Installation uses
+descriptor-relative operations,
 no-follow destination inspection, exclusive temporary files, fsync, and
 atomic rename. The client sends an exact file identity/timestamp token; stale
 or unexpected destinations are rejected. Overwrite confirmation is explicit.

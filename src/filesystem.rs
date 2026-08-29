@@ -16,6 +16,31 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 pub const IWD_DIRECTORY: &str = "/var/lib/iwd";
 
+const SERVICE_PRIVATE_PATHS: [&str; 9] = [
+    "/home",
+    "/root",
+    "/run/user",
+    "/tmp",
+    "/var/tmp",
+    "/dev",
+    "/usr/lib/modules",
+    "/proc/kallsyms",
+    "/proc/kcore",
+];
+
+pub fn path_is_visible_to_service(path: &Path) -> bool {
+    service_path_is_visible(path)
+        && fs::canonicalize(path)
+            .map(|path| service_path_is_visible(&path))
+            .unwrap_or(false)
+}
+
+fn service_path_is_visible(path: &Path) -> bool {
+    !SERVICE_PRIVATE_PATHS
+        .iter()
+        .any(|private_path| path.starts_with(private_path))
+}
+
 static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug)]
@@ -326,6 +351,9 @@ impl Installer {
 }
 
 fn validate_referenced_file(path: &Path) -> Result<(), InstallError> {
+    if !path_is_visible_to_service(path) {
+        return Err(InstallError::InvalidReferencedFile);
+    }
     let metadata = fs::metadata(path).map_err(|_| InstallError::InvalidReferencedFile)?;
     if !metadata.is_file() {
         return Err(InstallError::InvalidReferencedFile);
@@ -546,5 +574,26 @@ mod tests {
                 & 0o777,
             0o700
         );
+    }
+
+    #[test]
+    fn service_path_policy_excludes_private_mounts() {
+        for path in [
+            "/home/user/client.pem",
+            "/root/client.pem",
+            "/run/user/1000/client.pem",
+            "/tmp/client.pem",
+            "/var/tmp/client.pem",
+            "/dev/shm/client.pem",
+            "/usr/lib/modules/client.pem",
+            "/proc/kallsyms",
+            "/proc/kcore",
+        ] {
+            assert!(!service_path_is_visible(Path::new(path)));
+        }
+        assert!(service_path_is_visible(Path::new("/etc/ssl/client.pem")));
+        assert!(service_path_is_visible(Path::new(
+            "/var/lib/iwd/client.pem"
+        )));
     }
 }

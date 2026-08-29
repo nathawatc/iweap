@@ -119,11 +119,18 @@ impl<R: BufRead> Input<R> {
             let path = PathBuf::from(value);
             if path.is_absolute() && path.to_str().is_some() {
                 match std::fs::metadata(&path) {
-                    Ok(metadata) if metadata.is_file() => return Ok(Some(path)),
+                    Ok(metadata)
+                        if metadata.is_file()
+                            && iweap::filesystem::path_is_visible_to_service(&path) =>
+                    {
+                        return Ok(Some(path));
+                    }
                     _ => {}
                 }
             }
-            eprintln!("Path must be absolute and point to an existing file.");
+            eprintln!(
+                "Path must be absolute, point to an existing file, and be visible to the system service."
+            );
         }
     }
 

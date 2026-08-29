@@ -1,5 +1,5 @@
 [D-BUS Service]
 Name=org.codeberg.iweap
-Exec=/usr/lib/iweap/iweap-service
+Exec=/bin/false
 User=root
 SystemdService=org.codeberg.iweap.service
