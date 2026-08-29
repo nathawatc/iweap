@@ -47,7 +47,7 @@ impl Pty {
             .stderr(Stdio::from(stderr));
         unsafe {
             command.pre_exec(|| {
-                for signal in [libc::SIGHUP, libc::SIGINT, libc::SIGTERM] {
+                for signal in [libc::SIGHUP, libc::SIGINT, libc::SIGQUIT, libc::SIGTERM] {
                     if libc::signal(signal, libc::SIG_DFL) == libc::SIG_ERR {
                         return Err(io::Error::last_os_error());
                     }
@@ -225,6 +225,20 @@ fn sigint_before_secret_prompt_terminates_with_signal_status() {
 }
 
 #[test]
+fn sigquit_before_secret_prompt_terminates_with_signal_status() {
+    let (mut pty, mut child) = Pty::spawn();
+    pty.read_until(b"SSID: ");
+    send_signal(&child, libc::SIGQUIT);
+    assert!(pty.echo_enabled());
+    let status = child.wait_with_timeout();
+    assert_eq!(
+        status.code(),
+        Some(128 + libc::SIGQUIT),
+        "SIGQUIT before secret input must use the managed signal path"
+    );
+}
+
+#[test]
 fn sigint_during_secret_restores_echo() {
     assert_signal_during_secret(libc::SIGINT);
 }
@@ -237,6 +251,11 @@ fn sigterm_during_secret_restores_echo() {
 #[test]
 fn sighup_during_secret_restores_echo() {
     assert_signal_during_secret(libc::SIGHUP);
+}
+
+#[test]
+fn sigquit_during_secret_restores_echo() {
+    assert_signal_during_secret(libc::SIGQUIT);
 }
 
 #[test]
@@ -257,6 +276,29 @@ fn sigterm_after_secret_prompt_is_not_ignored() {
     pty.wait_for_echo(true);
     send_signal(&child, libc::SIGTERM);
     assert_eq!(child.wait_with_timeout().code(), Some(128 + libc::SIGTERM));
+}
+
+#[test]
+fn sigquit_after_secret_prompt_is_not_ignored() {
+    let (mut pty, mut child) = at_secret_prompt();
+    pty.send(b"secret\n");
+    pty.read_until(b"Install this profile into /var/lib/iwd? [y/N]: ");
+    pty.wait_for_echo(true);
+    send_signal(&child, libc::SIGQUIT);
+    assert_eq!(child.wait_with_timeout().code(), Some(128 + libc::SIGQUIT));
+}
+
+#[test]
+fn sigquit_during_second_secret_prompt_restores_echo() {
+    let (mut pty, mut child) = at_secret_prompt();
+    pty.send(b"\n");
+    pty.read_until(b"This secret is required.");
+    pty.read_until(b"Password (stored in profile): ");
+    pty.wait_for_echo(false);
+    send_signal(&child, libc::SIGQUIT);
+    pty.wait_for_echo(true);
+    let status = child.wait_with_timeout();
+    assert_eq!(status.code(), Some(128 + libc::SIGQUIT));
 }
 
 #[test]

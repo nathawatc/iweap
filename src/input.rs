@@ -1,6 +1,6 @@
 use iweap::Secret;
 use rustix::termios::{LocalModes, OptionalActions, tcgetattr, tcsetattr};
-use signal_hook::consts::signal::{SIGHUP, SIGINT, SIGTERM};
+use signal_hook::consts::signal::{SIGHUP, SIGINT, SIGQUIT, SIGTERM};
 use signal_hook::iterator::Signals;
 use std::fs::{File, OpenOptions};
 use std::io::{self, BufRead, Write};
@@ -163,7 +163,8 @@ pub struct SignalManager {
 
 impl SignalManager {
     pub fn install() -> Result<Self, InputError> {
-        let mut signals = Signals::new([SIGHUP, SIGINT, SIGTERM]).map_err(InputError::Signal)?;
+        let mut signals =
+            Signals::new([SIGHUP, SIGINT, SIGQUIT, SIGTERM]).map_err(InputError::Signal)?;
         let active_secret =
             std::sync::Arc::new(std::sync::Mutex::new(None::<mpsc::Sender<SecretEvent>>));
         let listener_active = std::sync::Arc::clone(&active_secret);
