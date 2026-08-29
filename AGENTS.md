@@ -14,16 +14,18 @@
 
 ## Ownership
 
-- `model.rs`: EAP taxonomy, capabilities, validation, wire conversion, IWD serialization.
+- `model/`: EAP taxonomy, capabilities, validation, wire conversion, and IWD serialization.
 - `filesystem.rs`: destination inspection and durable profile installation.
 - `ipc.rs`: application D-Bus and Polkit identifiers plus client authorization call.
 - `service.rs`: privileged request ordering, authorization, activity lifecycle.
 - `main.rs` and `input.rs`: unprivileged interaction and terminal handling.
 - `data/`: required cross-format systemd, D-Bus, and Polkit projections.
 
-Keep `EapMethod` as EAP taxonomy SSOT. Reuse pure model validators at every trust
-boundary. Preserve independent security assertions in tests. Any identifier or
-filesystem-policy projection change requires packaging regression coverage.
+Keep `EapMethod` in `model/eap.rs` as EAP taxonomy SSOT; validation, wire, and
+IWD rendering consume it rather than redefining it. Reuse pure model validators
+at every trust boundary. Preserve independent security assertions in tests. Any
+identifier or filesystem-policy projection change requires packaging regression
+coverage.
 
 ## Completion
 
