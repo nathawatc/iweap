@@ -1,11 +1,18 @@
 [package]
 name = "iweap"
-version = "0.1.0"
+version = "1.0.0"
 edition = "2024"
 rust-version = "1.87"
 description = "Secure interactive IWD 802.1X profile generator"
-license-file = "LICENSE"
+license = "GPL-3.0-or-later"
+repository = "https://codeberg.org/nathawat/iweap"
 default-run = "iweap"
+keywords = ["iwd", "8021x", "eap", "wifi", "networking"]
+categories = ["command-line-utilities", "network-programming"]
+exclude = [
+    "/AGENTS.md",
+]
+publish = false
 
 [lib]
 name = "iweap"
@@ -18,6 +25,10 @@ path = "src/main.rs"
 [[bin]]
 name = "iweap-service"
 path = "src/bin/iweap-service.rs"
+
+[profile.release]
+lto = true
+codegen-units = 1
 
 [dependencies]
 async-io = "2.6"

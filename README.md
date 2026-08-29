@@ -2,18 +2,35 @@
 
 Interactive generator and installer for IWD 802.1X profiles.
 
-## Build
+## Requirements
 
-Requires Linux, Rust 1.87+, IWD, systemd, D-Bus, Polkit, and a Polkit
+Building requires Linux and Rust 1.87+.
+
+Full profile installation requires IWD, systemd, D-Bus, Polkit, and a Polkit
 authentication agent.
-
-```sh
-cargo build --release
-```
 
 ## Install
 
-Build first, then install binaries and data as root:
+<details>
+<summary><h3>Arch Linux<h3></summary>
+
+### Install from AUR
+
+Using an AUR helper, for example:
+
+```sh
+paru -S iweap
+```
+
+</details>
+
+### Build from Source
+
+```sh
+cargo build --locked --release
+```
+
+Then install the binaries and system integration files as root:
 
 ```sh
 install -Dm755 target/release/iweap /usr/bin/iweap
@@ -29,7 +46,7 @@ install -Dm644 data/systemd/org.codeberg.iweap.service \
 systemctl daemon-reload
 ```
 
-Service is D-Bus activated; do not enable it at boot.
+The service is D-Bus activated and should not be enabled at boot.
 
 ## Use
 
@@ -54,6 +71,6 @@ accessible to IWD. Existing profiles require explicit overwrite confirmation.
 
 ## Troubleshooting
 
-- No authentication prompt: verify Polkit and desktop authentication agent run.
-- Service activation fails: verify install paths, then run `systemctl daemon-reload`.
+- No authentication prompt: verify that Polkit and a desktop authentication agent are running.
+- Service activation fails: verify the installation paths, then run `systemctl daemon-reload`.
 - TLS path rejected: use an absolute path to a regular file readable by IWD.

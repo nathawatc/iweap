@@ -1,4 +1,4 @@
-# Maintainer contract
+# Maintainer Contract
 
 `iweap` is Linux-only Rust CLI plus root installer for IWD 802.1X profiles.
 
