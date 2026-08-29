@@ -12,7 +12,7 @@ authentication agent.
 ## Install
 
 <details>
-<summary><h3>Arch Linux<h3></summary>
+<summary><h3>Arch Linux</h3></summary>
 
 ### Install from AUR
 
