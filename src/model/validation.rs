@@ -8,6 +8,7 @@ pub const MAX_EAP_DEPTH: usize = 4;
 pub const MAX_EAP_LAYERS: usize = MAX_EAP_DEPTH + 1;
 pub const MAX_TEXT_BYTES: usize = 4096;
 pub const MAX_SECRET_BYTES: usize = 4096;
+const MAX_GTC_PASSWORD_BYTES: usize = 2048;
 pub const MAX_DOMAIN_MASK_BYTES: usize = 1024;
 pub const PASSWORD_HASH_HEX_CHARS: usize = 32;
 
@@ -37,6 +38,8 @@ pub enum ValidationError {
     InvalidPasswordHash,
     PasswordConflict,
     CredentialNeedsIdentity,
+    GtcPasswordTooLong,
+    MschapPasswordNotUcs2,
 }
 
 impl fmt::Display for ValidationError {
@@ -73,6 +76,15 @@ impl fmt::Display for ValidationError {
             }
             Self::PasswordConflict => "password and password hash cannot both be set",
             Self::CredentialNeedsIdentity => "stored credentials require an identity",
+            Self::GtcPasswordTooLong => {
+                return write!(
+                    f,
+                    "GTC password exceeds IWD's {MAX_GTC_PASSWORD_BYTES}-byte limit"
+                );
+            }
+            Self::MschapPasswordNotUcs2 => {
+                "MSCHAP password contains characters not representable in UCS-2"
+            }
         };
         f.write_str(message)
     }
@@ -236,6 +248,7 @@ impl TlsConfig {
 fn validate_secret_pair(layer: &EapLayer) -> Result<(), ValidationError> {
     if let Some(password) = layer.password.as_ref() {
         validate_secret(password)?;
+        validate_method_password(layer.method, password)?;
     }
     if let Some(password_hash) = layer.password_hash.as_ref() {
         validate_secret(password_hash)?;
@@ -248,6 +261,16 @@ fn validate_secret_pair(layer: &EapLayer) -> Result<(), ValidationError> {
     }
     if (layer.password.is_some() || layer.password_hash.is_some()) && layer.identity.is_none() {
         return Err(ValidationError::CredentialNeedsIdentity);
+    }
+    Ok(())
+}
+
+fn validate_method_password(method: EapMethod, password: &Secret) -> Result<(), ValidationError> {
+    if method.has_gtc_password_limit() && password.as_str().len() > MAX_GTC_PASSWORD_BYTES {
+        return Err(ValidationError::GtcPasswordTooLong);
+    }
+    if method.uses_mschap_password_hashing() && !is_ucs2_representable(password.as_str()) {
+        return Err(ValidationError::MschapPasswordNotUcs2);
     }
     Ok(())
 }
@@ -338,6 +361,12 @@ pub fn is_valid_domain_mask(mask: &str) -> bool {
 
 pub fn is_valid_password_hash(value: &str) -> bool {
     value.len() == PASSWORD_HASH_HEX_CHARS && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+fn is_ucs2_representable(value: &str) -> bool {
+    value
+        .chars()
+        .all(|character| u32::from(character) <= 0xffff)
 }
 
 #[cfg(test)]
@@ -578,5 +607,303 @@ mod tests {
             });
             assert_eq!(profile(vec![layer_pkcs12]).validate(), Ok(()));
         }
+    }
+
+    #[test]
+    fn ucs2_representability_check_identifies_boundary_characters() {
+        assert!(is_ucs2_representable(""));
+        assert!(is_ucs2_representable("ascii"));
+        assert!(is_ucs2_representable("pässword"));
+        assert!(is_ucs2_representable("密碼"));
+        assert!(is_ucs2_representable("\u{ffff}"));
+        assert!(!is_ucs2_representable("\u{10000}"));
+        assert!(!is_ucs2_representable("abc😀def"));
+    }
+
+    #[test]
+    fn gtc_password_limit_enforces_exact_utf8_byte_boundary() {
+        let mut peap = EapLayer::new(EapMethod::Peap);
+        peap.tls = Some(empty_tls());
+
+        // 1. 2048 ASCII bytes -> PASS
+        let pass_2048 = "a".repeat(2048);
+        let valid_profile = profile(vec![
+            peap,
+            password_layer(EapMethod::Gtc, "user", &pass_2048),
+        ]);
+        assert_eq!(valid_profile.validate(), Ok(()));
+
+        // 2. 2049 ASCII bytes -> FAIL
+        let mut peap2 = EapLayer::new(EapMethod::Peap);
+        peap2.tls = Some(empty_tls());
+        let fail_2049 = "a".repeat(2049);
+        let invalid_profile = profile(vec![
+            peap2,
+            password_layer(EapMethod::Gtc, "user", &fail_2049),
+        ]);
+        assert_eq!(
+            invalid_profile.validate(),
+            Err(ValidationError::GtcPasswordTooLong)
+        );
+
+        // 3. UTF-8 byte boundary with multibyte characters:
+        // 'é' is 2 bytes in UTF-8. 1025 characters = 1025 chars < 2048, but 2050 bytes > 2048.
+        let mut peap3 = EapLayer::new(EapMethod::Peap);
+        peap3.tls = Some(empty_tls());
+        let multibyte_pwd = "é".repeat(1025);
+        assert!(multibyte_pwd.chars().count() < 2048);
+        assert!(multibyte_pwd.len() > 2048);
+        let invalid_multibyte = profile(vec![
+            peap3,
+            password_layer(EapMethod::Gtc, "user", &multibyte_pwd),
+        ]);
+        assert_eq!(
+            invalid_multibyte.validate(),
+            Err(ValidationError::GtcPasswordTooLong)
+        );
+
+        // Multibyte characters fitting within 2048 bytes: 1024 'é' = 2048 bytes -> PASS
+        let mut peap4 = EapLayer::new(EapMethod::Peap);
+        peap4.tls = Some(empty_tls());
+        let multibyte_2048 = "é".repeat(1024);
+        assert_eq!(multibyte_2048.len(), 2048);
+        let valid_multibyte = profile(vec![
+            peap4,
+            password_layer(EapMethod::Gtc, "user", &multibyte_2048),
+        ]);
+        assert_eq!(valid_multibyte.validate(), Ok(()));
+
+        // 4. Nested GTC inside TTLS
+        let mut ttls = EapLayer::new(EapMethod::Ttls);
+        ttls.tls = Some(empty_tls());
+        let ttls_gtc_valid = profile(vec![
+            ttls,
+            password_layer(EapMethod::Gtc, "user", &pass_2048),
+        ]);
+        assert_eq!(ttls_gtc_valid.validate(), Ok(()));
+
+        let mut ttls2 = EapLayer::new(EapMethod::Ttls);
+        ttls2.tls = Some(empty_tls());
+        let ttls_gtc_invalid = profile(vec![
+            ttls2,
+            password_layer(EapMethod::Gtc, "user", &fail_2049),
+        ]);
+        assert_eq!(
+            ttls_gtc_invalid.validate(),
+            Err(ValidationError::GtcPasswordTooLong)
+        );
+    }
+
+    #[test]
+    fn mschap_family_enforces_ucs2_character_repertoire() {
+        // Direct MSCHAPV2 BMP Unicode passes (accented, CJK)
+        assert_eq!(
+            profile(vec![password_layer(
+                EapMethod::Mschapv2,
+                "user",
+                "pässword"
+            )])
+            .validate(),
+            Ok(())
+        );
+        assert_eq!(
+            profile(vec![password_layer(EapMethod::Mschapv2, "user", "密碼")]).validate(),
+            Ok(())
+        );
+
+        // Direct MSCHAPV2 supplementary-plane Unicode fails
+        let invalid = profile(vec![password_layer(
+            EapMethod::Mschapv2,
+            "user",
+            "abc😀def",
+        )]);
+        assert_eq!(
+            invalid.validate(),
+            Err(ValidationError::MschapPasswordNotUcs2)
+        );
+        // Error message does not leak secret
+        let err = invalid.validate().unwrap_err();
+        let display = format!("{err}");
+        assert!(!display.contains("abc"));
+        assert!(!display.contains("😀"));
+        assert!(!display.contains("def"));
+
+        // Direct MSCHAPV2 with password hash is unaffected by UCS-2 rule
+        let mut hash_layer = EapLayer::new(EapMethod::Mschapv2);
+        hash_layer.identity = Some(String::from("user"));
+        hash_layer.password_hash = Some(Secret::new("0123456789abcdef0123456789abcdef"));
+        assert_eq!(profile(vec![hash_layer]).validate(), Ok(()));
+
+        // PEAP -> MSCHAPV2
+        let make_peap = || {
+            let mut peap = EapLayer::new(EapMethod::Peap);
+            peap.tls = Some(empty_tls());
+            peap
+        };
+        assert_eq!(
+            profile(vec![
+                make_peap(),
+                password_layer(EapMethod::Mschapv2, "user", "pässword")
+            ])
+            .validate(),
+            Ok(())
+        );
+        assert_eq!(
+            profile(vec![
+                make_peap(),
+                password_layer(EapMethod::Mschapv2, "user", "abc😀def")
+            ])
+            .validate(),
+            Err(ValidationError::MschapPasswordNotUcs2)
+        );
+
+        // TTLS -> EAP-MSCHAPV2
+        let make_ttls = || {
+            let mut ttls = EapLayer::new(EapMethod::Ttls);
+            ttls.tls = Some(empty_tls());
+            ttls
+        };
+        assert_eq!(
+            profile(vec![
+                make_ttls(),
+                password_layer(EapMethod::Mschapv2, "user", "pässword")
+            ])
+            .validate(),
+            Ok(())
+        );
+        assert_eq!(
+            profile(vec![
+                make_ttls(),
+                password_layer(EapMethod::Mschapv2, "user", "abc😀def")
+            ])
+            .validate(),
+            Err(ValidationError::MschapPasswordNotUcs2)
+        );
+
+        // TTLS Tunneled-MSCHAP
+        assert_eq!(
+            profile(vec![
+                make_ttls(),
+                password_layer(EapMethod::TunneledMschap, "user", "pässword")
+            ])
+            .validate(),
+            Ok(())
+        );
+        assert_eq!(
+            profile(vec![
+                make_ttls(),
+                password_layer(EapMethod::TunneledMschap, "user", "abc😀def")
+            ])
+            .validate(),
+            Err(ValidationError::MschapPasswordNotUcs2)
+        );
+
+        // TTLS Tunneled-MSCHAPv2
+        assert_eq!(
+            profile(vec![
+                make_ttls(),
+                password_layer(EapMethod::TunneledMschapv2, "user", "pässword")
+            ])
+            .validate(),
+            Ok(())
+        );
+        assert_eq!(
+            profile(vec![
+                make_ttls(),
+                password_layer(EapMethod::TunneledMschapv2, "user", "abc😀def")
+            ])
+            .validate(),
+            Err(ValidationError::MschapPasswordNotUcs2)
+        );
+    }
+
+    #[test]
+    fn non_mschap_methods_and_omitted_credentials_are_unaffected() {
+        let make_ttls = || {
+            let mut ttls = EapLayer::new(EapMethod::Ttls);
+            ttls.tls = Some(empty_tls());
+            ttls
+        };
+        let make_peap = || {
+            let mut peap = EapLayer::new(EapMethod::Peap);
+            peap.tls = Some(empty_tls());
+            peap
+        };
+
+        // Tunneled-PAP accepts supplementary-plane Unicode
+        assert_eq!(
+            profile(vec![
+                make_ttls(),
+                password_layer(EapMethod::TunneledPap, "user", "pap_secret_😀")
+            ])
+            .validate(),
+            Ok(())
+        );
+
+        // Tunneled-CHAP accepts supplementary-plane Unicode
+        assert_eq!(
+            profile(vec![
+                make_ttls(),
+                password_layer(EapMethod::TunneledChap, "user", "chap_secret_😀")
+            ])
+            .validate(),
+            Ok(())
+        );
+
+        // MD5 accepts supplementary-plane Unicode
+        assert_eq!(
+            profile(vec![
+                make_peap(),
+                password_layer(EapMethod::Md5, "user", "md5_secret_😀")
+            ])
+            .validate(),
+            Ok(())
+        );
+
+        // PWD accepts supplementary-plane Unicode
+        assert_eq!(
+            profile(vec![
+                make_peap(),
+                password_layer(EapMethod::Pwd, "user", "pwd_secret_😀")
+            ])
+            .validate(),
+            Ok(())
+        );
+
+        // Omitted credentials (agent asks later) remain valid across all methods
+        let mut omitted_gtc = EapLayer::new(EapMethod::Gtc);
+        omitted_gtc.identity = Some(String::from("user"));
+        assert_eq!(profile(vec![make_peap(), omitted_gtc]).validate(), Ok(()));
+
+        let mut omitted_mschap = EapLayer::new(EapMethod::Mschapv2);
+        omitted_mschap.identity = Some(String::from("user"));
+        assert_eq!(profile(vec![omitted_mschap]).validate(), Ok(()));
+
+        let mut omitted_tunneled_mschap = EapLayer::new(EapMethod::TunneledMschap);
+        omitted_tunneled_mschap.identity = Some(String::from("user"));
+        assert_eq!(
+            profile(vec![make_ttls(), omitted_tunneled_mschap]).validate(),
+            Ok(())
+        );
+
+        // Generic maximum (MAX_SECRET_BYTES = 4096) remains enforced
+        let oversized = "a".repeat(MAX_SECRET_BYTES + 1);
+        assert_eq!(
+            profile(vec![
+                make_ttls(),
+                password_layer(EapMethod::TunneledPap, "user", &oversized)
+            ])
+            .validate(),
+            Err(ValidationError::SecretTooLong)
+        );
+        assert_eq!(
+            profile(vec![password_layer(
+                EapMethod::Mschapv2,
+                "user",
+                &oversized
+            )])
+            .validate(),
+            Err(ValidationError::SecretTooLong)
+        );
     }
 }

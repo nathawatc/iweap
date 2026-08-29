@@ -178,6 +178,17 @@ impl EapMethod {
         matches!(self, Self::Tls | Self::WfaTls)
     }
 
+    pub(crate) const fn uses_mschap_password_hashing(self) -> bool {
+        matches!(
+            self,
+            Self::Mschapv2 | Self::TunneledMschap | Self::TunneledMschapv2
+        )
+    }
+
+    pub(crate) const fn has_gtc_password_limit(self) -> bool {
+        matches!(self, Self::Gtc)
+    }
+
     pub const fn is_tunnel_method(self) -> bool {
         matches!(self.kind(), MethodKind::Tunnel)
     }
@@ -328,6 +339,29 @@ mod tests {
         {
             let expected = matches!(method, EapMethod::Tls | EapMethod::WfaTls);
             assert_eq!(method.supports_tls_client_credentials(), expected);
+        }
+    }
+
+    #[test]
+    fn credential_capabilities_are_modeled_correctly() {
+        assert!(EapMethod::Gtc.has_gtc_password_limit());
+        assert!(EapMethod::Mschapv2.uses_mschap_password_hashing());
+        assert!(EapMethod::TunneledMschap.uses_mschap_password_hashing());
+        assert!(EapMethod::TunneledMschapv2.uses_mschap_password_hashing());
+
+        for method in EapMethod::OUTER
+            .iter()
+            .chain(EapMethod::INNER)
+            .chain(EapMethod::TTLS_TUNNELED)
+        {
+            let expected_gtc = matches!(method, EapMethod::Gtc);
+            assert_eq!(method.has_gtc_password_limit(), expected_gtc);
+
+            let expected_mschap = matches!(
+                method,
+                EapMethod::Mschapv2 | EapMethod::TunneledMschap | EapMethod::TunneledMschapv2
+            );
+            assert_eq!(method.uses_mschap_password_hashing(), expected_mschap);
         }
     }
 }
