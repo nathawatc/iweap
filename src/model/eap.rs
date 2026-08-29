@@ -174,6 +174,10 @@ impl EapMethod {
         matches!(self.kind(), MethodKind::Tls)
     }
 
+    pub const fn supports_tls_client_credentials(self) -> bool {
+        matches!(self, Self::Tls | Self::WfaTls)
+    }
+
     pub const fn is_tunnel_method(self) -> bool {
         matches!(self.kind(), MethodKind::Tunnel)
     }
@@ -307,6 +311,23 @@ mod tests {
             assert!(!method.name().is_empty());
             assert_eq!(EapMethod::from_wire(method.wire_code()), Some(method));
             assert_eq!(method.wire_code(), (index + 1) as u8);
+        }
+    }
+
+    #[test]
+    fn tls_client_credential_capabilities_are_modeled_correctly() {
+        assert!(EapMethod::Tls.supports_tls_client_credentials());
+        assert!(EapMethod::WfaTls.supports_tls_client_credentials());
+        assert!(!EapMethod::Peap.supports_tls_client_credentials());
+        assert!(!EapMethod::Ttls.supports_tls_client_credentials());
+
+        for method in EapMethod::OUTER
+            .iter()
+            .chain(EapMethod::INNER)
+            .chain(EapMethod::TTLS_TUNNELED)
+        {
+            let expected = matches!(method, EapMethod::Tls | EapMethod::WfaTls);
+            assert_eq!(method.supports_tls_client_credentials(), expected);
         }
     }
 }

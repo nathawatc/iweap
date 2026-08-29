@@ -84,14 +84,18 @@ impl Profile {
                     .tls
                     .as_ref()
                     .ok_or(ValidationError::MissingTlsConfiguration)?;
-                render_tls(output, &format!("{prefix}TLS-"), tls, include_secrets)?;
+                let tls_prefix = format!("{prefix}TLS-");
+                render_tls_common(output, &tls_prefix, tls)?;
+                if method.supports_tls_client_credentials() {
+                    render_tls_client_credentials(output, &tls_prefix, tls, include_secrets)?;
+                }
             }
             EapMethod::Peap => {
                 let tls = layer
                     .tls
                     .as_ref()
                     .ok_or(ValidationError::MissingTlsConfiguration)?;
-                render_tls(output, &format!("{prefix}PEAP-"), tls, include_secrets)?;
+                render_tls_common(output, &format!("{prefix}PEAP-"), tls)?;
                 self.render_layer(
                     output,
                     index + 1,
@@ -104,7 +108,7 @@ impl Profile {
                     .tls
                     .as_ref()
                     .ok_or(ValidationError::MissingTlsConfiguration)?;
-                render_tls(output, &format!("{prefix}TTLS-"), tls, include_secrets)?;
+                render_tls_common(output, &format!("{prefix}TTLS-"), tls)?;
                 let child = &self.layers[index + 1];
                 if child.method.is_tunneled() {
                     append_setting(
@@ -204,11 +208,10 @@ fn append_secret_setting(
     append_setting(output, key, value)
 }
 
-fn render_tls(
+fn render_tls_common(
     output: &mut String,
     prefix: &str,
     tls: &TlsConfig,
-    include_secrets: bool,
 ) -> Result<(), ValidationError> {
     if let Some(ca_cert) = tls.ca_cert.as_deref() {
         append_path_setting(output, &format!("{prefix}CACert"), ca_cert)?;
@@ -227,6 +230,15 @@ fn render_tls(
             },
         )?;
     }
+    Ok(())
+}
+
+fn render_tls_client_credentials(
+    output: &mut String,
+    prefix: &str,
+    tls: &TlsConfig,
+    include_secrets: bool,
+) -> Result<(), ValidationError> {
     match &tls.client {
         TlsClientCredentials::None => {}
         TlsClientCredentials::CertificateAndKey { certificate, key } => {
@@ -429,5 +441,184 @@ mod tests {
             .redacted_config()
             .expect("valid nested TLS profile");
         assert!(config.contains("EAP-TTLS-Phase2-TLS-ClientKeyBundle=/etc/ssl/client.p12\n"));
+    }
+
+    #[test]
+    fn nested_peap_and_ttls_to_inner_tls_preserves_client_credentials() {
+        // PEAP -> TLS with CertificateAndKey and passphrase
+        let mut peap_outer = EapLayer::new(EapMethod::Peap);
+        peap_outer.identity = Some(String::from("anon-peap"));
+        peap_outer.tls = Some(TlsConfig {
+            ca_cert: Some(PathBuf::from("/etc/ssl/peap-ca.pem")),
+            server_domain_mask: Some(String::from("peap.example.com")),
+            fast_reauthentication: Some(true),
+            client: TlsClientCredentials::None,
+            client_key_passphrase: None,
+        });
+
+        let mut peap_inner_tls = EapLayer::new(EapMethod::Tls);
+        peap_inner_tls.identity = Some(String::from("peap-inner-user"));
+        peap_inner_tls.tls = Some(TlsConfig {
+            ca_cert: Some(PathBuf::from("/etc/ssl/inner-ca.pem")),
+            server_domain_mask: Some(String::from("inner.example.com")),
+            fast_reauthentication: Some(false),
+            client: TlsClientCredentials::CertificateAndKey {
+                certificate: PathBuf::from("/etc/ssl/inner-client.pem"),
+                key: PathBuf::from("/etc/ssl/inner-client.key"),
+            },
+            client_key_passphrase: Some(Secret::new("inner-passphrase")),
+        });
+
+        let peap_profile = profile(vec![peap_outer, peap_inner_tls]);
+        assert_eq!(peap_profile.validate(), Ok(()));
+
+        let peap_config = peap_profile
+            .redacted_config()
+            .expect("valid PEAP->TLS profile");
+        assert!(peap_config.contains("EAP-Method=PEAP\n"));
+        assert!(peap_config.contains("EAP-Identity=anon-peap\n"));
+        assert!(peap_config.contains("EAP-PEAP-CACert=/etc/ssl/peap-ca.pem\n"));
+        assert!(peap_config.contains("EAP-PEAP-ServerDomainMask=peap.example.com\n"));
+        assert!(peap_config.contains("EAP-PEAP-FastReauthentication=true\n"));
+        assert!(peap_config.contains("EAP-PEAP-Phase2-Method=TLS\n"));
+        assert!(peap_config.contains("EAP-PEAP-Phase2-Identity=peap-inner-user\n"));
+        assert!(peap_config.contains("EAP-PEAP-Phase2-TLS-CACert=/etc/ssl/inner-ca.pem\n"));
+        assert!(peap_config.contains("EAP-PEAP-Phase2-TLS-ServerDomainMask=inner.example.com\n"));
+        assert!(peap_config.contains("EAP-PEAP-Phase2-TLS-FastReauthentication=false\n"));
+        assert!(peap_config.contains("EAP-PEAP-Phase2-TLS-ClientCert=/etc/ssl/inner-client.pem\n"));
+        assert!(peap_config.contains("EAP-PEAP-Phase2-TLS-ClientKey=/etc/ssl/inner-client.key\n"));
+        assert!(peap_config.contains("EAP-PEAP-Phase2-TLS-ClientKeyPassphrase=<redacted>\n"));
+
+        let peap_plain = peap_profile
+            .serialize_plain()
+            .expect("serialize plain PEAP->TLS");
+        let peap_plain_str =
+            std::str::from_utf8(peap_plain.as_bytes()).expect("valid UTF-8 plain profile");
+        assert!(
+            peap_plain_str.contains("EAP-PEAP-Phase2-TLS-ClientKeyPassphrase=inner-passphrase\n")
+        );
+
+        // TTLS -> TLS with CertificateAndKey
+        let mut ttls_outer = EapLayer::new(EapMethod::Ttls);
+        ttls_outer.identity = Some(String::from("anon-ttls"));
+        ttls_outer.tls = Some(TlsConfig {
+            ca_cert: Some(PathBuf::from("/etc/ssl/ttls-ca.pem")),
+            server_domain_mask: None,
+            fast_reauthentication: None,
+            client: TlsClientCredentials::None,
+            client_key_passphrase: None,
+        });
+
+        let mut ttls_inner_tls = EapLayer::new(EapMethod::Tls);
+        ttls_inner_tls.tls = Some(TlsConfig {
+            ca_cert: None,
+            server_domain_mask: None,
+            fast_reauthentication: None,
+            client: TlsClientCredentials::CertificateAndKey {
+                certificate: PathBuf::from("/etc/ssl/ttls-client.pem"),
+                key: PathBuf::from("/etc/ssl/ttls-client.key"),
+            },
+            client_key_passphrase: None,
+        });
+
+        let ttls_profile = profile(vec![ttls_outer, ttls_inner_tls]);
+        assert_eq!(ttls_profile.validate(), Ok(()));
+        let ttls_config = ttls_profile
+            .redacted_config()
+            .expect("valid TTLS->TLS profile");
+        assert!(ttls_config.contains("EAP-Method=TTLS\n"));
+        assert!(ttls_config.contains("EAP-Identity=anon-ttls\n"));
+        assert!(ttls_config.contains("EAP-TTLS-CACert=/etc/ssl/ttls-ca.pem\n"));
+        assert!(ttls_config.contains("EAP-TTLS-Phase2-Method=TLS\n"));
+        assert!(ttls_config.contains("EAP-TTLS-Phase2-TLS-ClientCert=/etc/ssl/ttls-client.pem\n"));
+        assert!(ttls_config.contains("EAP-TTLS-Phase2-TLS-ClientKey=/etc/ssl/ttls-client.key\n"));
+    }
+
+    #[test]
+    fn outer_peap_and_ttls_profiles_never_serialize_forbidden_client_keys() {
+        let forbidden_keys = [
+            "EAP-PEAP-ClientCert",
+            "EAP-PEAP-ClientKey",
+            "EAP-PEAP-ClientKeyBundle",
+            "EAP-PEAP-ClientKeyPassphrase",
+            "EAP-TTLS-ClientCert",
+            "EAP-TTLS-ClientKey",
+            "EAP-TTLS-ClientKeyBundle",
+            "EAP-TTLS-ClientKeyPassphrase",
+        ];
+
+        // PEAP with MSCHAPv2
+        let mut peap_outer = EapLayer::new(EapMethod::Peap);
+        peap_outer.identity = Some(String::from("anon"));
+        peap_outer.tls = Some(TlsConfig {
+            ca_cert: Some(PathBuf::from("/etc/ssl/ca.pem")),
+            server_domain_mask: Some(String::from("radius.example.com")),
+            fast_reauthentication: Some(true),
+            client: TlsClientCredentials::None,
+            client_key_passphrase: None,
+        });
+        let peap_mschap = profile(vec![
+            peap_outer,
+            password_layer(EapMethod::Mschapv2, "user", "secret"),
+        ]);
+        let peap_mschap_config = peap_mschap.redacted_config().expect("valid config");
+        for key in &forbidden_keys {
+            assert!(
+                !peap_mschap_config.contains(key),
+                "peap config contains forbidden key {key}"
+            );
+        }
+
+        // TTLS with TunneledPap
+        let mut ttls_outer = EapLayer::new(EapMethod::Ttls);
+        ttls_outer.identity = Some(String::from("anon"));
+        ttls_outer.tls = Some(TlsConfig {
+            ca_cert: Some(PathBuf::from("/etc/ssl/ca.pem")),
+            server_domain_mask: Some(String::from("radius.example.com")),
+            fast_reauthentication: Some(true),
+            client: TlsClientCredentials::None,
+            client_key_passphrase: None,
+        });
+        let mut child = EapLayer::new(EapMethod::TunneledPap);
+        child.identity = Some(String::from("user"));
+        child.password = Some(Secret::new("secret"));
+        let ttls_pap = profile(vec![ttls_outer, child]);
+        let ttls_pap_config = ttls_pap.redacted_config().expect("valid config");
+        for key in &forbidden_keys {
+            assert!(
+                !ttls_pap_config.contains(key),
+                "ttls config contains forbidden key {key}"
+            );
+        }
+
+        // PEAP with inner TLS
+        let mut peap_outer2 = EapLayer::new(EapMethod::Peap);
+        peap_outer2.identity = Some(String::from("anon"));
+        peap_outer2.tls = Some(TlsConfig {
+            ca_cert: Some(PathBuf::from("/etc/ssl/ca.pem")),
+            server_domain_mask: None,
+            fast_reauthentication: None,
+            client: TlsClientCredentials::None,
+            client_key_passphrase: None,
+        });
+        let mut inner_tls = EapLayer::new(EapMethod::Tls);
+        inner_tls.tls = Some(TlsConfig {
+            ca_cert: None,
+            server_domain_mask: None,
+            fast_reauthentication: None,
+            client: TlsClientCredentials::CertificateAndKey {
+                certificate: PathBuf::from("/etc/ssl/client.pem"),
+                key: PathBuf::from("/etc/ssl/client.key"),
+            },
+            client_key_passphrase: Some(Secret::new("pass")),
+        });
+        let peap_tls = profile(vec![peap_outer2, inner_tls]);
+        let peap_tls_config = peap_tls.redacted_config().expect("valid config");
+        for key in &forbidden_keys {
+            assert!(
+                !peap_tls_config.contains(key),
+                "peap->tls config contains forbidden outer key {key}"
+            );
+        }
     }
 }

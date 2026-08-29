@@ -220,7 +220,7 @@ fn configure_layer<R: BufRead>(
         }
         MethodKind::Tls | MethodKind::Tunnel => {
             layer.identity = prompt_identity(input, method, outer, store_credentials)?;
-            layer.tls = Some(configure_tls(input, store_credentials)?);
+            layer.tls = Some(configure_tls(input, method, store_credentials)?);
         }
         MethodKind::TunneledPassword => {
             configure_tunneled_fields(input, &mut layer, store_credentials)?;
@@ -325,10 +325,13 @@ fn configure_tunneled_fields<R: BufRead>(
     Ok(())
 }
 
-fn configure_tls<R: BufRead>(
-    input: &mut Input<R>,
-    store_credentials: bool,
-) -> Result<TlsConfig, AppError> {
+struct TlsCommon {
+    ca_cert: Option<std::path::PathBuf>,
+    server_domain_mask: Option<String>,
+    fast_reauthentication: Option<bool>,
+}
+
+fn configure_tls_common<R: BufRead>(input: &mut Input<R>) -> Result<TlsCommon, AppError> {
     let ca_cert = input.path(
         "CA certificate path (absolute; blank disables CA verification): ",
         false,
@@ -350,6 +353,17 @@ fn configure_tls<R: BufRead>(
     };
     let fast_reauthentication =
         input.optional_bool("Fast reauthentication [y/n/blank to omit]: ")?;
+    Ok(TlsCommon {
+        ca_cert,
+        server_domain_mask,
+        fast_reauthentication,
+    })
+}
+
+fn configure_tls_client_credentials<R: BufRead>(
+    input: &mut Input<R>,
+    store_credentials: bool,
+) -> Result<(TlsClientCredentials, Option<Secret>), AppError> {
     let client = loop {
         eprintln!(
             "\nTLS client credentials:\n  0) No client certificate\n  1) Separate client certificate and private key\n  2) PKCS#12 client key bundle"
@@ -386,10 +400,24 @@ fn configure_tls<R: BufRead>(
     } else {
         None
     };
+    Ok((client, client_key_passphrase))
+}
+
+fn configure_tls<R: BufRead>(
+    input: &mut Input<R>,
+    method: EapMethod,
+    store_credentials: bool,
+) -> Result<TlsConfig, AppError> {
+    let common = configure_tls_common(input)?;
+    let (client, client_key_passphrase) = if method.supports_tls_client_credentials() {
+        configure_tls_client_credentials(input, store_credentials)?
+    } else {
+        (TlsClientCredentials::None, None)
+    };
     Ok(TlsConfig {
-        ca_cert,
-        server_domain_mask,
-        fast_reauthentication,
+        ca_cert: common.ca_cert,
+        server_domain_mask: common.server_domain_mask,
+        fast_reauthentication: common.fast_reauthentication,
         client,
         client_key_passphrase,
     })
@@ -467,7 +495,7 @@ mod tests {
 
         let mut layers = Vec::new();
         configure_layer(
-            &mut Input::new(Cursor::new(b"\n\n\n0\n1\n\n")),
+            &mut Input::new(Cursor::new(b"\n\n\n1\n\n")),
             &mut layers,
             EapMethod::Peap,
             0,
@@ -482,7 +510,7 @@ mod tests {
 
         let mut layers = Vec::new();
         configure_layer(
-            &mut Input::new(Cursor::new(b"\n\n\n0\n1\n\n")),
+            &mut Input::new(Cursor::new(b"\n\n\n1\n\n")),
             &mut layers,
             EapMethod::Ttls,
             0,
@@ -522,6 +550,226 @@ mod tests {
             configure_password(&mut input, EapMethod::Mschapv2, false)
                 .expect("credentials omitted"),
             (None, None)
+        );
+    }
+
+    #[test]
+    fn cli_peap_flow_prompts_tls_common_and_never_client_credentials() {
+        // Inputs:
+        // 1. "anon-peap\n" -> PEAP outer identity
+        // 2. "/etc/hosts\n" -> CA cert path (existing regular file)
+        // 3. "radius.example.com;*.corp\n" -> Server domain mask (prompted because CA cert is Some)
+        // 4. "y\n" -> Fast reauthentication: true
+        // (NO client credential prompt!)
+        // 5. "3\n" -> Inner EAP method: MSCHAPv2 (index 3 in EapMethod::INNER)
+        // 6. "mschap-user\n" -> MSCHAPv2 identity
+        let input_bytes = b"anon-peap\n/etc/hosts\nradius.example.com;*.corp\ny\n3\nmschap-user\n";
+        let mut cursor = Cursor::new(&input_bytes[..]);
+        let mut layers = Vec::new();
+        configure_layer(
+            &mut Input::new(&mut cursor),
+            &mut layers,
+            EapMethod::Peap,
+            0,
+            true,
+            false,
+        )
+        .expect("configure PEAP");
+
+        assert_eq!(
+            cursor.position() as usize,
+            input_bytes.len(),
+            "all expected prompts were consumed without asking for client credentials"
+        );
+        assert_eq!(layers.len(), 2);
+        assert_eq!(layers[0].method, EapMethod::Peap);
+        assert_eq!(layers[0].identity.as_deref(), Some("anon-peap"));
+        let peap_tls = layers[0].tls.as_ref().expect("PEAP TLS config");
+        assert_eq!(
+            peap_tls.ca_cert.as_deref(),
+            Some(std::path::Path::new("/etc/hosts"))
+        );
+        assert_eq!(
+            peap_tls.server_domain_mask.as_deref(),
+            Some("radius.example.com;*.corp")
+        );
+        assert_eq!(peap_tls.fast_reauthentication, Some(true));
+        assert_eq!(peap_tls.client, TlsClientCredentials::None);
+        assert_eq!(peap_tls.client_key_passphrase, None);
+
+        assert_eq!(layers[1].method, EapMethod::Mschapv2);
+        assert_eq!(layers[1].identity.as_deref(), Some("mschap-user"));
+    }
+
+    #[test]
+    fn cli_ttls_flow_prompts_tls_common_and_never_client_credentials() {
+        // Inputs:
+        // 1. "anon-ttls\n" -> TTLS outer identity
+        // 2. "/etc/hosts\n" -> CA cert path
+        // 3. "*.example.org\n" -> Server domain mask
+        // 4. "n\n" -> Fast reauthentication: false
+        // (NO client credential prompt!)
+        // 5. "1\n" -> Phase-2 method: Tunneled-PAP (index 1 in TTLS_TUNNELED + INNER)
+        // 6. "pap-user\n" -> Tunneled-PAP identity
+        let input_bytes = b"anon-ttls\n/etc/hosts\n*.example.org\nn\n1\npap-user\n";
+        let mut cursor = Cursor::new(&input_bytes[..]);
+        let mut layers = Vec::new();
+        configure_layer(
+            &mut Input::new(&mut cursor),
+            &mut layers,
+            EapMethod::Ttls,
+            0,
+            true,
+            false,
+        )
+        .expect("configure TTLS");
+
+        assert_eq!(
+            cursor.position() as usize,
+            input_bytes.len(),
+            "all expected prompts were consumed without asking for client credentials"
+        );
+        assert_eq!(layers.len(), 2);
+        assert_eq!(layers[0].method, EapMethod::Ttls);
+        assert_eq!(layers[0].identity.as_deref(), Some("anon-ttls"));
+        let ttls_tls = layers[0].tls.as_ref().expect("TTLS TLS config");
+        assert_eq!(
+            ttls_tls.ca_cert.as_deref(),
+            Some(std::path::Path::new("/etc/hosts"))
+        );
+        assert_eq!(
+            ttls_tls.server_domain_mask.as_deref(),
+            Some("*.example.org")
+        );
+        assert_eq!(ttls_tls.fast_reauthentication, Some(false));
+        assert_eq!(ttls_tls.client, TlsClientCredentials::None);
+        assert_eq!(ttls_tls.client_key_passphrase, None);
+
+        assert_eq!(layers[1].method, EapMethod::TunneledPap);
+        assert_eq!(layers[1].identity.as_deref(), Some("pap-user"));
+    }
+
+    #[test]
+    fn cli_direct_tls_and_wfa_tls_flows_prompt_client_credentials() {
+        // Direct TLS with CertificateAndKey:
+        // 1. "tls-user\n" -> identity
+        // 2. "/etc/hosts\n" -> CA cert path
+        // 3. "\n" -> Server domain mask omitted
+        // 4. "y\n" -> Fast reauthentication
+        // 5. "1\n" -> Client credential form 1: Certificate and key
+        // 6. "/etc/hosts\n" -> Client certificate path
+        // 7. "/etc/hosts\n" -> Client private key path
+        let input_bytes = b"tls-user\n/etc/hosts\n\ny\n1\n/etc/hosts\n/etc/hosts\n";
+        let mut cursor = Cursor::new(&input_bytes[..]);
+        let mut layers = Vec::new();
+        configure_layer(
+            &mut Input::new(&mut cursor),
+            &mut layers,
+            EapMethod::Tls,
+            0,
+            true,
+            false,
+        )
+        .expect("configure TLS");
+
+        assert_eq!(cursor.position() as usize, input_bytes.len());
+        assert_eq!(layers.len(), 1);
+        assert_eq!(layers[0].method, EapMethod::Tls);
+        let tls = layers[0].tls.as_ref().expect("TLS config");
+        assert_eq!(
+            tls.client,
+            TlsClientCredentials::CertificateAndKey {
+                certificate: std::path::PathBuf::from("/etc/hosts"),
+                key: std::path::PathBuf::from("/etc/hosts"),
+            }
+        );
+
+        // WFA-TLS with PKCS#12:
+        // 1. "wfa-user\n" -> identity
+        // 2. "\n" -> CA cert omitted
+        // 3. "\n" -> Fast reauthentication omitted
+        // 4. "2\n" -> Client credential form 2: PKCS#12 bundle
+        // 5. "/etc/hosts\n" -> Bundle path
+        let input_bytes = b"wfa-user\n\n\n2\n/etc/hosts\n";
+        let mut cursor = Cursor::new(&input_bytes[..]);
+        let mut layers = Vec::new();
+        configure_layer(
+            &mut Input::new(&mut cursor),
+            &mut layers,
+            EapMethod::WfaTls,
+            0,
+            true,
+            false,
+        )
+        .expect("configure WFA-TLS");
+
+        assert_eq!(cursor.position() as usize, input_bytes.len());
+        assert_eq!(layers.len(), 1);
+        assert_eq!(layers[0].method, EapMethod::WfaTls);
+        let tls = layers[0].tls.as_ref().expect("WFA-TLS config");
+        assert_eq!(
+            tls.client,
+            TlsClientCredentials::Pkcs12 {
+                bundle: std::path::PathBuf::from("/etc/hosts"),
+            }
+        );
+
+        // Direct TLS must still prompt for the client credential form.
+        let mut layers = Vec::new();
+        let error = configure_layer(
+            &mut Input::new(Cursor::new(b"tls-user\n\n\n")),
+            &mut layers,
+            EapMethod::Tls,
+            0,
+            true,
+            false,
+        )
+        .expect_err("TLS must prompt for client credentials");
+        assert!(matches!(error, AppError::Input(InputError::EndOfInput)));
+    }
+
+    #[test]
+    fn cli_nested_peap_to_inner_tls_prompts_client_credentials_on_inner_tls() {
+        // Outer PEAP:
+        // 1. "anon-peap\n" -> PEAP identity
+        // 2. "\n" -> PEAP CA omitted
+        // 3. "\n" -> PEAP fast reauth omitted
+        // (NO outer client credential prompt!)
+        // 4. "9\n" -> Inner method selection: 9 = TLS
+        // Inner TLS:
+        // 5. "inner-tls-user\n" -> inner TLS identity
+        // 6. "\n" -> inner CA omitted
+        // 7. "\n" -> inner fast reauth omitted
+        // 8. "1\n" -> inner client credential form 1: Certificate and key
+        // 9. "/etc/hosts\n" -> inner client cert
+        // 10. "/etc/hosts\n" -> inner private key
+        let input_bytes = b"anon-peap\n\n\n9\ninner-tls-user\n\n\n1\n/etc/hosts\n/etc/hosts\n";
+        let mut cursor = Cursor::new(&input_bytes[..]);
+        let mut layers = Vec::new();
+        configure_layer(
+            &mut Input::new(&mut cursor),
+            &mut layers,
+            EapMethod::Peap,
+            0,
+            true,
+            false,
+        )
+        .expect("configure PEAP->TLS");
+
+        assert_eq!(cursor.position() as usize, input_bytes.len());
+        assert_eq!(layers.len(), 2);
+        assert_eq!(layers[0].method, EapMethod::Peap);
+        assert_eq!(
+            layers[0].tls.as_ref().unwrap().client,
+            TlsClientCredentials::None
+        );
+        assert_eq!(layers[1].method, EapMethod::Tls);
+        assert_eq!(
+            layers[1].tls.as_ref().unwrap().client,
+            TlsClientCredentials::CertificateAndKey {
+                certificate: std::path::PathBuf::from("/etc/hosts"),
+                key: std::path::PathBuf::from("/etc/hosts"),
+            }
         );
     }
 }

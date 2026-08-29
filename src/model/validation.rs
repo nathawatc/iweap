@@ -174,11 +174,17 @@ impl Profile {
             if layer.password.is_some() || layer.password_hash.is_some() {
                 return Err(ValidationError::MethodHasUnexpectedFields);
             }
-            return layer
+            let tls = layer
                 .tls
                 .as_ref()
-                .ok_or(ValidationError::MissingTlsConfiguration)?
-                .validate();
+                .ok_or(ValidationError::MissingTlsConfiguration)?;
+            if !layer.method.supports_tls_client_credentials()
+                && (!matches!(tls.client, TlsClientCredentials::None)
+                    || tls.client_key_passphrase.is_some())
+            {
+                return Err(ValidationError::MethodHasUnexpectedFields);
+            }
+            return tls.validate();
         }
         if layer.method.is_tunneled() {
             return self.validate_tunneled_fields(layer);
@@ -462,5 +468,115 @@ mod tests {
         }
         layers.push(password_layer(EapMethod::Mschapv2, "user", "secret"));
         assert_eq!(profile(layers).validate(), Ok(()));
+    }
+
+    #[test]
+    fn peap_and_ttls_reject_outer_client_credentials() {
+        let cert_and_key = TlsClientCredentials::CertificateAndKey {
+            certificate: std::path::PathBuf::from("/etc/ssl/client.pem"),
+            key: std::path::PathBuf::from("/etc/ssl/client.key"),
+        };
+        let pkcs12 = TlsClientCredentials::Pkcs12 {
+            bundle: std::path::PathBuf::from("/etc/ssl/client.p12"),
+        };
+
+        for client in [cert_and_key, pkcs12] {
+            let mut peap = EapLayer::new(EapMethod::Peap);
+            peap.tls = Some(TlsConfig {
+                client,
+                ..empty_tls()
+            });
+            let peap_profile = profile(vec![
+                peap,
+                password_layer(EapMethod::Mschapv2, "user", "secret"),
+            ]);
+            assert_eq!(
+                peap_profile.validate(),
+                Err(ValidationError::MethodHasUnexpectedFields)
+            );
+        }
+
+        let cert_and_key = TlsClientCredentials::CertificateAndKey {
+            certificate: std::path::PathBuf::from("/etc/ssl/client.pem"),
+            key: std::path::PathBuf::from("/etc/ssl/client.key"),
+        };
+        let pkcs12 = TlsClientCredentials::Pkcs12 {
+            bundle: std::path::PathBuf::from("/etc/ssl/client.p12"),
+        };
+
+        for client in [cert_and_key, pkcs12] {
+            let mut ttls = EapLayer::new(EapMethod::Ttls);
+            ttls.tls = Some(TlsConfig {
+                client,
+                ..empty_tls()
+            });
+            let mut child = EapLayer::new(EapMethod::TunneledPap);
+            child.identity = Some(String::from("user"));
+            child.password = Some(Secret::new("secret"));
+            let ttls_profile = profile(vec![ttls, child]);
+            assert_eq!(
+                ttls_profile.validate(),
+                Err(ValidationError::MethodHasUnexpectedFields)
+            );
+        }
+    }
+
+    #[test]
+    fn peap_and_ttls_reject_outer_client_key_passphrase() {
+        let mut peap = EapLayer::new(EapMethod::Peap);
+        peap.tls = Some(TlsConfig {
+            client_key_passphrase: Some(Secret::new("outer-passphrase")),
+            ..empty_tls()
+        });
+        let peap_profile = profile(vec![
+            peap,
+            password_layer(EapMethod::Mschapv2, "user", "secret"),
+        ]);
+        assert_eq!(
+            peap_profile.validate(),
+            Err(ValidationError::MethodHasUnexpectedFields)
+        );
+
+        let mut ttls = EapLayer::new(EapMethod::Ttls);
+        ttls.tls = Some(TlsConfig {
+            client_key_passphrase: Some(Secret::new("outer-passphrase")),
+            ..empty_tls()
+        });
+        let mut child = EapLayer::new(EapMethod::TunneledPap);
+        child.identity = Some(String::from("user"));
+        child.password = Some(Secret::new("secret"));
+        let ttls_profile = profile(vec![ttls, child]);
+        assert_eq!(
+            ttls_profile.validate(),
+            Err(ValidationError::MethodHasUnexpectedFields)
+        );
+    }
+
+    #[test]
+    fn direct_tls_and_wfa_tls_allow_client_credentials() {
+        for method in [EapMethod::Tls, EapMethod::WfaTls] {
+            let mut layer_cert_key = EapLayer::new(method);
+            layer_cert_key.identity = Some(String::from("user"));
+            layer_cert_key.tls = Some(TlsConfig {
+                client: TlsClientCredentials::CertificateAndKey {
+                    certificate: std::path::PathBuf::from("/etc/ssl/client.pem"),
+                    key: std::path::PathBuf::from("/etc/ssl/client.key"),
+                },
+                client_key_passphrase: Some(Secret::new("passphrase")),
+                ..empty_tls()
+            });
+            assert_eq!(profile(vec![layer_cert_key]).validate(), Ok(()));
+
+            let mut layer_pkcs12 = EapLayer::new(method);
+            layer_pkcs12.identity = Some(String::from("user"));
+            layer_pkcs12.tls = Some(TlsConfig {
+                client: TlsClientCredentials::Pkcs12 {
+                    bundle: std::path::PathBuf::from("/etc/ssl/client.p12"),
+                },
+                client_key_passphrase: Some(Secret::new("passphrase")),
+                ..empty_tls()
+            });
+            assert_eq!(profile(vec![layer_pkcs12]).validate(), Ok(()));
+        }
     }
 }
