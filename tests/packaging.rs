@@ -29,6 +29,80 @@ fn method_block<'a>(introspection: &'a str, name: &str) -> &'a str {
     &remainder[..end]
 }
 
+fn action_block<'a>(policy: &'a str, id: &str) -> &'a str {
+    let marker = format!("<action id=\"{id}\">");
+    let start = policy.find(&marker).expect("action in policy");
+    let remainder = &policy[start..];
+    let end = remainder
+        .find("</action>")
+        .expect("action closing tag in policy")
+        + "</action>".len();
+    &remainder[..end]
+}
+
+fn element_text<'a>(xml: &'a str, element: &str) -> &'a str {
+    let mut matches = Vec::new();
+    let open_prefix = format!("<{element}");
+    let close_prefix = format!("</{element}");
+
+    let mut search_idx = 0;
+    while let Some(start) = xml[search_idx..].find(&open_prefix) {
+        let tag_start = search_idx + start;
+        let after_prefix = &xml[tag_start + open_prefix.len()..];
+        if let Some(first_char) = after_prefix.chars().next() {
+            if first_char == '>' || first_char.is_ascii_whitespace() {
+                let tag_end_rel = after_prefix.find('>').expect("closing '>' for opening tag");
+                let content_start = tag_start + open_prefix.len() + tag_end_rel + 1;
+                let remainder = &xml[content_start..];
+                let close_start_rel = remainder.find(&close_prefix).expect("closing tag start");
+                let after_close_prefix = &remainder[close_start_rel + close_prefix.len()..];
+                let close_first_char = after_close_prefix
+                    .chars()
+                    .next()
+                    .expect("character after closing tag name");
+                assert!(
+                    close_first_char == '>' || close_first_char.is_ascii_whitespace(),
+                    "closing tag prefix matched unexpected tag name"
+                );
+                let body = &remainder[..close_start_rel];
+                matches.push(body.trim());
+            }
+        }
+        search_idx = tag_start + open_prefix.len();
+    }
+
+    assert_eq!(
+        matches.len(),
+        1,
+        "expected exactly one <{element}> in XML block, found {}",
+        matches.len()
+    );
+    matches[0]
+}
+
+#[test]
+fn element_text_helper_handles_whitespace_and_rejects_duplicates() {
+    let single = "<allow_any>\n    no\n</allow_any>";
+    assert_eq!(element_text(single, "allow_any"), "no");
+
+    let with_space = "<allow_any >no</allow_any>";
+    assert_eq!(element_text(with_space, "allow_any"), "no");
+}
+
+#[test]
+#[should_panic(expected = "expected exactly one <allow_any>")]
+fn element_text_helper_rejects_duplicate_tags() {
+    let duplicate = "<allow_any>no</allow_any><allow_any>yes</allow_any>";
+    let _ = element_text(duplicate, "allow_any");
+}
+
+#[test]
+#[should_panic(expected = "expected exactly one <allow_any>")]
+fn element_text_helper_rejects_duplicate_tags_with_spaces() {
+    let duplicate = "<allow_any>no</allow_any><allow_any >yes</allow_any>";
+    let _ = element_text(duplicate, "allow_any");
+}
+
 #[test]
 fn cross_format_service_contract_is_synchronized() {
     let bus_policy = data_file("dbus/org.codeberg.iweap.conf");
@@ -62,11 +136,21 @@ fn cross_format_service_contract_is_synchronized() {
         setting(&unit, "ExecStart"),
         Some("/usr/lib/iweap/iweap-service")
     );
-    assert!(polkit.contains(&format!("<action id=\"{AUTHORIZATION_ACTION}\">")));
-    assert!(polkit.contains("<description>Inspect or install an IWD 802.1X profile</description>"));
-    assert!(polkit.contains(
-        "<message>Authentication is required to inspect or install an IWD 802.1X profile.</message>"
-    ));
+    let polkit_action = action_block(&polkit, AUTHORIZATION_ACTION);
+    assert_eq!(
+        element_text(polkit_action, "description"),
+        "Inspect or install an IWD 802.1X profile"
+    );
+    assert_eq!(
+        element_text(polkit_action, "message"),
+        "Authentication is required to inspect or install an IWD 802.1X profile."
+    );
+    assert_eq!(element_text(polkit_action, "allow_any"), "no");
+    assert_eq!(element_text(polkit_action, "allow_inactive"), "no");
+    assert_eq!(
+        element_text(polkit_action, "allow_active"),
+        "auth_admin_keep"
+    );
 
     assert_eq!(
         setting(&unit, "StateDirectory"),
