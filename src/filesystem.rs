@@ -16,31 +16,6 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 pub const IWD_DIRECTORY: &str = "/var/lib/iwd";
 
-const SERVICE_PRIVATE_PATHS: [&str; 9] = [
-    "/home",
-    "/root",
-    "/run/user",
-    "/tmp",
-    "/var/tmp",
-    "/dev",
-    "/usr/lib/modules",
-    "/proc/kallsyms",
-    "/proc/kcore",
-];
-
-pub fn path_is_visible_to_service(path: &Path) -> bool {
-    service_path_is_visible(path)
-        && fs::canonicalize(path)
-            .map(|path| service_path_is_visible(&path))
-            .unwrap_or(false)
-}
-
-fn service_path_is_visible(path: &Path) -> bool {
-    !SERVICE_PRIVATE_PATHS
-        .iter()
-        .any(|private_path| path.starts_with(private_path))
-}
-
 static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug)]
@@ -351,7 +326,7 @@ impl Installer {
 }
 
 fn validate_referenced_file(path: &Path) -> Result<(), InstallError> {
-    if !path_is_visible_to_service(path) {
+    if !path.is_absolute() || path.to_str().is_none() {
         return Err(InstallError::InvalidReferencedFile);
     }
     let metadata = fs::metadata(path).map_err(|_| InstallError::InvalidReferencedFile)?;
@@ -395,8 +370,9 @@ pub fn running_as_root() -> bool {
 mod tests {
     use super::*;
     use crate::model::{EapLayer, EapMethod, Secret};
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
     use std::os::unix::fs::{PermissionsExt, symlink};
-    use std::os::unix::net::UnixListener;
     use std::sync::atomic::{AtomicU64, Ordering};
 
     static FIXTURE_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -436,6 +412,17 @@ mod tests {
 
     fn ok<T, E: std::fmt::Debug>(result: Result<T, E>) -> T {
         result.expect("test operation")
+    }
+
+    fn create_fifo(path: &Path) {
+        let path = CString::new(path.as_os_str().as_bytes()).expect("FIFO path");
+        let result = unsafe { libc::mkfifo(path.as_ptr(), 0o600) };
+        assert_eq!(
+            result,
+            0,
+            "create FIFO: {}",
+            std::io::Error::last_os_error()
+        );
     }
 
     #[test]
@@ -538,7 +525,7 @@ mod tests {
         fs::set_permissions(&fixture.root, fs::Permissions::from_mode(0o700))
             .expect("restrict state directory");
         let filename = profile("secret").profile_filename().expect("filename");
-        let _socket = UnixListener::bind(fixture.root.join(filename)).expect("create socket");
+        create_fifo(&fixture.root.join(filename));
         let installer = Installer::for_test(fixture.root.clone());
 
         assert!(matches!(
@@ -577,23 +564,41 @@ mod tests {
     }
 
     #[test]
-    fn service_path_policy_excludes_private_mounts() {
-        for path in [
-            "/home/user/client.pem",
-            "/root/client.pem",
-            "/run/user/1000/client.pem",
-            "/tmp/client.pem",
-            "/var/tmp/client.pem",
-            "/dev/shm/client.pem",
-            "/usr/lib/modules/client.pem",
-            "/proc/kallsyms",
-            "/proc/kcore",
-        ] {
-            assert!(!service_path_is_visible(Path::new(path)));
-        }
-        assert!(service_path_is_visible(Path::new("/etc/ssl/client.pem")));
-        assert!(service_path_is_visible(Path::new(
-            "/var/lib/iwd/client.pem"
-        )));
+    fn referenced_file_validation_checks_actual_filesystem_properties() {
+        let fixture = Fixture::new();
+        let regular = fixture.parent.join("client.pem");
+        fs::write(&regular, b"certificate").expect("create regular file");
+        let directory = fixture.parent.join("directory");
+        fs::create_dir(&directory).expect("create directory");
+        let special = fixture.parent.join("special");
+        create_fifo(&special);
+        assert!(validate_referenced_file(&regular).is_ok());
+        assert!(matches!(
+            validate_referenced_file(Path::new("client.pem")),
+            Err(InstallError::InvalidReferencedFile)
+        ));
+        assert!(matches!(
+            validate_referenced_file(&fixture.parent.join("missing.pem")),
+            Err(InstallError::InvalidReferencedFile)
+        ));
+        assert!(matches!(
+            validate_referenced_file(&directory),
+            Err(InstallError::InvalidReferencedFile)
+        ));
+        assert!(matches!(
+            validate_referenced_file(&special),
+            Err(InstallError::InvalidReferencedFile)
+        ));
+    }
+
+    #[test]
+    fn referenced_file_validation_follows_symlinks_like_iwd() {
+        let fixture = Fixture::new();
+        let regular = fixture.parent.join("client.pem");
+        let link = fixture.parent.join("client-link.pem");
+        fs::write(&regular, b"certificate").expect("create regular file");
+        symlink(&regular, &link).expect("create symlink");
+
+        assert!(validate_referenced_file(&link).is_ok());
     }
 }

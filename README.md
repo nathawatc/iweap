@@ -81,12 +81,11 @@ When selected, IWD-compatible profile secrets remain plaintext at rest in
 `/var/lib/iwd`; the root-owned directory is mode `0700` and each profile is
 root-owned mode `0600`.
 
-Certificate and key paths are validated as absolute existing regular files
-visible inside the systemd service namespace and are referenced, not copied.
-Paths under `/home`, `/root`, `/run/user`, `/tmp`, `/var/tmp`, `/dev`, and
-`/usr/lib/modules`, plus `/proc/kallsyms` and `/proc/kcore`, are rejected
-because the unit hides or privatizes them. Installation uses
-descriptor-relative operations,
-no-follow destination inspection, exclusive temporary files, fsync, and
-atomic rename. The client sends an exact file identity/timestamp token; stale
-or unexpected destinations are rejected. Overwrite confirmation is explicit.
+TLS certificate and key paths are referenced, not copied. They must remain
+accessible to IWD when the profile is used. The installer rejects referenced
+files it cannot validate from its service namespace; this does not guarantee
+that IWD can access them when it uses the profile. Installation uses
+descriptor-relative operations, no-follow destination inspection, exclusive
+temporary files, fsync, and atomic rename. The client sends an exact file
+identity/timestamp token; stale or unexpected destinations are rejected.
+Overwrite confirmation is explicit.
