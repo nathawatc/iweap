@@ -3,8 +3,8 @@ use crate::model::{
     profile_filename_for_ssid, validate_ssid,
 };
 use rustix::fs::{
-    AtFlags, FileType, Gid, Mode, OFlags, RenameFlags, Uid, fchmod, fchown, fstat, fsync, mkdirat,
-    open, openat, renameat, renameat_with, statat, unlinkat,
+    AtFlags, FileType, Mode, OFlags, RenameFlags, fchmod, fstat, fsync, mkdirat, open, openat,
+    renameat, renameat_with, statat, unlinkat,
 };
 use rustix::process::geteuid;
 use std::fs::{self, File};
@@ -15,6 +15,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 pub const IWD_DIRECTORY: &str = "/var/lib/iwd";
+pub const IWD_DIRECTORY_MODE: u32 = 0o700;
+pub const PROFILE_MODE: u32 = 0o600;
 
 static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -38,7 +40,10 @@ impl std::fmt::Display for InstallError {
             Self::Invalid(error) => error.fmt(f),
             Self::Io { operation, detail } => write!(f, "{operation} failed: {detail}"),
             Self::DirectoryInsecure => {
-                f.write_str("IWD state directory is not root-owned with mode 0700")
+                write!(
+                    f,
+                    "IWD state directory is not root-owned with mode {IWD_DIRECTORY_MODE:04o}"
+                )
             }
             Self::UnexpectedDestination => {
                 f.write_str("existing profile path is not a regular file")
@@ -65,7 +70,6 @@ impl From<ValidationError> for InstallError {
 pub struct Installer {
     root: PathBuf,
     require_root_owner: bool,
-    set_owner: bool,
 }
 
 impl Installer {
@@ -73,16 +77,14 @@ impl Installer {
         Self {
             root: PathBuf::from(IWD_DIRECTORY),
             require_root_owner: true,
-            set_owner: true,
         }
     }
 
     #[cfg(test)]
-    fn for_test(root: PathBuf) -> Self {
+    pub(crate) fn for_test(root: PathBuf) -> Self {
         Self {
             root,
             require_root_owner: false,
-            set_owner: false,
         }
     }
 
@@ -223,12 +225,6 @@ impl Installer {
             fchmod(&root_fd, directory_mode())
                 .map_err(|error| io_error("restrict state directory", error))?;
         }
-        if self.set_owner && (metadata.st_uid != 0 || metadata.st_gid != 0) {
-            fchown(&root_fd, Some(Uid::ROOT), Some(Gid::ROOT))
-                .map_err(|error| io_error("set state directory ownership", error))?;
-            fchmod(&root_fd, directory_mode())
-                .map_err(|error| io_error("restrict state directory", error))?;
-        }
         Ok(Some(root_fd))
     }
 
@@ -271,12 +267,6 @@ impl Installer {
             file.write_all(plaintext.as_bytes())
                 .map_err(|error| io_error("write profile", error))?;
             fchmod(&file, profile_mode()).map_err(|error| io_error("restrict profile", error))?;
-            if self.set_owner {
-                fchown(&file, Some(Uid::ROOT), Some(Gid::ROOT))
-                    .map_err(|error| io_error("set profile ownership", error))?;
-                fchmod(&file, profile_mode())
-                    .map_err(|error| io_error("restrict profile", error))?;
-            }
             file.sync_all()
                 .map_err(|error| io_error("sync profile", error))?;
             drop(file);
@@ -337,11 +327,11 @@ fn validate_referenced_file(path: &Path) -> Result<(), InstallError> {
 }
 
 fn directory_mode() -> Mode {
-    Mode::RUSR | Mode::WUSR | Mode::XUSR
+    Mode::from_raw_mode(IWD_DIRECTORY_MODE)
 }
 
 fn profile_mode() -> Mode {
-    Mode::RUSR | Mode::WUSR
+    Mode::from_raw_mode(PROFILE_MODE)
 }
 
 fn next_temp_name() -> String {

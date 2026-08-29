@@ -1,14 +1,18 @@
 mod input;
 
 use input::{Input, InputError, SignalManager};
-use iweap::model::MAX_EAP_DEPTH;
+use iweap::model::{MAX_EAP_DEPTH, MAX_SSID_BYTES, MethodKind, PASSWORD_HASH_HEX_CHARS};
 use iweap::{
-    EapLayer, EapMethod, IWD_DIRECTORY, InstallRequest, Profile, Secret, TlsClientCredentials,
-    TlsConfig, ValidationError,
+    EapLayer, EapMethod, IWD_DIRECTORY, InstallRequest, PROFILE_MODE, Profile, Secret,
+    TlsClientCredentials, TlsConfig, ValidationError,
 };
 use std::io::{self, BufRead};
 
-const USAGE: &str = "Usage: iweap [--dry-run|--preview] [--help]\n\nInteractively create an IWD .8021x profile for /var/lib/iwd/.\n\nOptions:\n  --dry-run, --preview  Generate and display a redacted profile; do not install it.\n  --help                Show this help.\n\nThe unprivileged client sends typed requests over the system D-Bus. The root\nservice performs direct Polkit authorization and writes only /var/lib/iwd.\nCredentials are omitted by default so IWD can request them through its agent.\n";
+fn usage() -> String {
+    format!(
+        "Usage: iweap [--dry-run|--preview] [--help]\n\nInteractively create an IWD .8021x profile for {IWD_DIRECTORY}/.\n\nOptions:\n  --dry-run, --preview  Generate and display a redacted profile; do not install it.\n  --help                Show this help.\n\nThe unprivileged client sends typed requests over the system D-Bus. The root\nservice performs direct Polkit authorization and writes only {IWD_DIRECTORY}.\nCredentials are omitted by default so IWD can request them through its agent.\n"
+    )
+}
 
 #[derive(Debug)]
 enum AppError {
@@ -64,7 +68,7 @@ fn main() {
 }
 
 fn run() -> Result<(), AppError> {
-    let Some(options) = parse_args()? else {
+    let Some(options) = parse_args(std::env::args().skip(1))? else {
         return Ok(());
     };
     let signals = SignalManager::install()?;
@@ -76,15 +80,16 @@ fn run() -> Result<(), AppError> {
         if iweap::model::validate_ssid(&value).is_ok() {
             break value;
         }
-        eprintln!("SSID must contain 1 to 32 bytes.");
+        eprintln!("SSID must contain 1 to {MAX_SSID_BYTES} bytes.");
     };
     let filename = iweap::model::profile_filename_for_ssid(&ssid);
     eprintln!("IWD profile filename: {filename}");
 
-    let outer = select_outer_method(&mut input)?;
-    let store_credentials = match outer {
-        EapMethod::Aka | EapMethod::AkaPrime | EapMethod::Sim => false,
-        _ => select_credential_handling(&mut input)?,
+    let outer = select_method(&mut input, "Outer EAP method", EapMethod::OUTER)?;
+    let store_credentials = if outer.is_sim_method() {
+        false
+    } else {
+        select_credential_handling(&mut input)?
     };
 
     let mut layers = Vec::new();
@@ -122,22 +127,22 @@ fn run() -> Result<(), AppError> {
     };
     let installed_filename = proxy.install_profile(request)?;
     println!(
-        "Installed {IWD_DIRECTORY}/{installed_filename} with root:root ownership and mode 0600."
+        "Installed {IWD_DIRECTORY}/{installed_filename} with root:root ownership and mode {PROFILE_MODE:04o}."
     );
     Ok(())
 }
 
-fn parse_args() -> Result<Option<Options>, AppError> {
+fn parse_args(arguments: impl IntoIterator<Item = String>) -> Result<Option<Options>, AppError> {
     let mut dry_run = false;
-    for argument in std::env::args().skip(1) {
+    for argument in arguments {
         match argument.as_str() {
             "--dry-run" | "--preview" => dry_run = true,
             "--help" | "-h" => {
-                print!("{}", USAGE);
+                print!("{}", usage());
                 return Ok(None);
             }
             _ => {
-                eprint!("{}", USAGE);
+                eprint!("{}", usage());
                 return Err(AppError::Input(InputError::Io(io::Error::new(
                     io::ErrorKind::InvalidInput,
                     "unknown option",
@@ -148,23 +153,25 @@ fn parse_args() -> Result<Option<Options>, AppError> {
     Ok(Some(Options { dry_run }))
 }
 
-fn select_outer_method<R: BufRead>(input: &mut Input<R>) -> Result<EapMethod, AppError> {
+fn select_method<R: BufRead>(
+    input: &mut Input<R>,
+    title: &str,
+    methods: &[EapMethod],
+) -> Result<EapMethod, AppError> {
     loop {
-        eprintln!(
-            "\nOuter EAP method:\n  1) AKA\n  2) AKA'\n  3) MSCHAPV2\n  4) PEAP\n  5) PWD\n  6) SIM\n  7) TLS\n  8) TTLS\n  9) WFA-TLS (expanded TLS method supported by current IWD source)"
-        );
-        match input.line("Select outer EAP method [1-9]: ")?.as_str() {
-            "1" => return Ok(EapMethod::Aka),
-            "2" => return Ok(EapMethod::AkaPrime),
-            "3" => return Ok(EapMethod::Mschapv2),
-            "4" => return Ok(EapMethod::Peap),
-            "5" => return Ok(EapMethod::Pwd),
-            "6" => return Ok(EapMethod::Sim),
-            "7" => return Ok(EapMethod::Tls),
-            "8" => return Ok(EapMethod::Ttls),
-            "9" => return Ok(EapMethod::WfaTls),
-            _ => eprintln!("Choose a number from 1 to 9."),
+        eprintln!("\n{title}:");
+        for (index, method) in methods.iter().enumerate() {
+            eprintln!("{:>3}) {}", index + 1, method.name());
         }
+        let prompt = format!("Select method [1-{}]: ", methods.len());
+        let selection = input.line(&prompt)?.parse::<usize>().ok();
+        if let Some(method) = selection
+            .and_then(|selection| selection.checked_sub(1))
+            .and_then(|index| methods.get(index))
+        {
+            return Ok(*method);
+        }
+        eprintln!("Choose a number from 1 to {}.", methods.len());
     }
 }
 
@@ -181,52 +188,13 @@ fn select_credential_handling<R: BufRead>(input: &mut Input<R>) -> Result<bool, 
     }
 }
 
-fn select_inner_method<R: BufRead>(input: &mut Input<R>) -> Result<EapMethod, AppError> {
-    loop {
-        eprintln!(
-            "\nInner EAP method:\n  1) GTC\n  2) MD5\n  3) MSCHAPV2\n  4) PWD\n  5) AKA\n  6) AKA'\n  7) PEAP\n  8) SIM\n  9) TLS\n 10) TTLS\n 11) WFA-TLS (expanded TLS method)"
-        );
-        match input.line("Select inner EAP method [1-11]: ")?.as_str() {
-            "1" => return Ok(EapMethod::Gtc),
-            "2" => return Ok(EapMethod::Md5),
-            "3" => return Ok(EapMethod::Mschapv2),
-            "4" => return Ok(EapMethod::Pwd),
-            "5" => return Ok(EapMethod::Aka),
-            "6" => return Ok(EapMethod::AkaPrime),
-            "7" => return Ok(EapMethod::Peap),
-            "8" => return Ok(EapMethod::Sim),
-            "9" => return Ok(EapMethod::Tls),
-            "10" => return Ok(EapMethod::Ttls),
-            "11" => return Ok(EapMethod::WfaTls),
-            _ => eprintln!("Choose a number from 1 to 11."),
-        }
-    }
-}
-
 fn select_ttls_phase2_method<R: BufRead>(input: &mut Input<R>) -> Result<EapMethod, AppError> {
-    loop {
-        eprintln!(
-            "\nTTLS phase-2 method:\n  1) Tunneled-PAP\n  2) Tunneled-CHAP\n  3) Tunneled-MSCHAP\n  4) Tunneled-MSCHAPv2\n  5) GTC\n  6) MD5\n  7) MSCHAPV2\n  8) PWD\n  9) AKA\n 10) AKA'\n 11) PEAP\n 12) SIM\n 13) TLS\n 14) TTLS\n 15) WFA-TLS (expanded TLS method)"
-        );
-        match input.line("Select TTLS phase-2 method [1-15]: ")?.as_str() {
-            "1" => return Ok(EapMethod::TunneledPap),
-            "2" => return Ok(EapMethod::TunneledChap),
-            "3" => return Ok(EapMethod::TunneledMschap),
-            "4" => return Ok(EapMethod::TunneledMschapv2),
-            "5" => return Ok(EapMethod::Gtc),
-            "6" => return Ok(EapMethod::Md5),
-            "7" => return Ok(EapMethod::Mschapv2),
-            "8" => return Ok(EapMethod::Pwd),
-            "9" => return Ok(EapMethod::Aka),
-            "10" => return Ok(EapMethod::AkaPrime),
-            "11" => return Ok(EapMethod::Peap),
-            "12" => return Ok(EapMethod::Sim),
-            "13" => return Ok(EapMethod::Tls),
-            "14" => return Ok(EapMethod::Ttls),
-            "15" => return Ok(EapMethod::WfaTls),
-            _ => eprintln!("Choose a number from 1 to 15."),
-        }
-    }
+    let methods = EapMethod::TTLS_TUNNELED
+        .iter()
+        .chain(EapMethod::INNER)
+        .copied()
+        .collect::<Vec<_>>();
+    select_method(input, "TTLS phase-2 method", &methods)
 }
 
 fn configure_layer<R: BufRead>(
@@ -242,22 +210,19 @@ fn configure_layer<R: BufRead>(
     }
 
     let mut layer = EapLayer::new(method);
-    match method {
-        EapMethod::Aka | EapMethod::AkaPrime | EapMethod::Sim => {}
-        EapMethod::Gtc | EapMethod::Md5 | EapMethod::Mschapv2 | EapMethod::Pwd => {
+    match method.kind() {
+        MethodKind::Sim => {}
+        MethodKind::Password => {
             layer.identity = prompt_identity(input, method, outer, store_credentials)?;
             let (password, password_hash) = configure_password(input, method, store_credentials)?;
             layer.password = password;
             layer.password_hash = password_hash;
         }
-        EapMethod::Tls | EapMethod::WfaTls | EapMethod::Peap | EapMethod::Ttls => {
+        MethodKind::Tls | MethodKind::Tunnel => {
             layer.identity = prompt_identity(input, method, outer, store_credentials)?;
             layer.tls = Some(configure_tls(input, store_credentials)?);
         }
-        EapMethod::TunneledPap
-        | EapMethod::TunneledChap
-        | EapMethod::TunneledMschap
-        | EapMethod::TunneledMschapv2 => {
+        MethodKind::TunneledPassword => {
             configure_tunneled_fields(input, &mut layer, store_credentials)?;
         }
     }
@@ -265,7 +230,7 @@ fn configure_layer<R: BufRead>(
 
     match method {
         EapMethod::Peap => {
-            let child = select_inner_method(input)?;
+            let child = select_method(input, "Inner EAP method", EapMethod::INNER)?;
             configure_layer(input, layers, child, depth + 1, false, store_credentials)?;
         }
         EapMethod::Ttls => {
@@ -283,10 +248,7 @@ fn prompt_identity<R: BufRead>(
     outer: bool,
     store_credentials: bool,
 ) -> Result<Option<String>, AppError> {
-    if matches!(
-        method,
-        EapMethod::Aka | EapMethod::AkaPrime | EapMethod::Sim
-    ) {
+    if method.is_sim_method() {
         return Ok(None);
     }
     let scope = if outer {
@@ -294,10 +256,7 @@ fn prompt_identity<R: BufRead>(
     } else {
         "Phase-2 identity / username"
     };
-    let password_method = matches!(
-        method,
-        EapMethod::Gtc | EapMethod::Md5 | EapMethod::Mschapv2 | EapMethod::Pwd
-    );
+    let password_method = method.is_password_method();
     if password_method && store_credentials {
         Ok(Some(input.required(&format!(
             "{scope} (required when storing credentials): "
@@ -322,7 +281,7 @@ fn configure_password<R: BufRead>(
     if method == EapMethod::Mschapv2 {
         loop {
             eprintln!(
-                "\nMSCHAPV2 credential format:\n  1) Password (IWD derives the NT hash)\n  2) Existing 32-hex-character MD4 password hash"
+                "\nMSCHAPV2 credential format:\n  1) Password (IWD derives the NT hash)\n  2) Existing {PASSWORD_HASH_HEX_CHARS}-hex-character MD4 password hash"
             );
             match input.line("Select credential format [1-2]: ")?.as_str() {
                 "1" => {
@@ -333,12 +292,12 @@ fn configure_password<R: BufRead>(
                 }
                 "2" => loop {
                     let hash = input.secret_required("MD4 password hash (stored in profile): ")?;
-                    if hash.as_str().len() == 32
-                        && hash.as_str().bytes().all(|byte| byte.is_ascii_hexdigit())
-                    {
+                    if iweap::model::is_valid_password_hash(hash.as_str()) {
                         return Ok((None, Some(hash)));
                     }
-                    eprintln!("Hash must contain exactly 32 hexadecimal characters.");
+                    eprintln!(
+                        "Hash must contain exactly {PASSWORD_HASH_HEX_CHARS} hexadecimal characters."
+                    );
                 },
                 _ => eprintln!("Choose 1 or 2."),
             }
@@ -452,4 +411,117 @@ fn show_preview(
         );
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Cursor;
+
+    #[test]
+    fn arguments_accept_preview_aliases_and_reject_unknown_options() {
+        let options = parse_args([String::from("--preview")])
+            .expect("valid arguments")
+            .expect("continue");
+        assert!(options.dry_run);
+        assert!(
+            parse_args([String::from("--help")])
+                .expect("help argument")
+                .is_none()
+        );
+        assert!(matches!(
+            parse_args([String::from("--unknown")]),
+            Err(AppError::Input(InputError::Io(error)))
+                if error.kind() == io::ErrorKind::InvalidInput
+        ));
+    }
+
+    #[test]
+    fn method_selection_uses_model_catalog_order_and_bounds() {
+        let mut input = Input::new(Cursor::new(b"0\ninvalid\n9\n"));
+        assert_eq!(
+            select_method(&mut input, "Outer", EapMethod::OUTER).expect("select method"),
+            EapMethod::WfaTls
+        );
+
+        let mut input = Input::new(Cursor::new(b"15\n"));
+        assert_eq!(
+            select_ttls_phase2_method(&mut input).expect("select TTLS method"),
+            EapMethod::WfaTls
+        );
+    }
+
+    #[test]
+    fn layer_configuration_follows_model_capabilities() {
+        let mut layers = Vec::new();
+        configure_layer(
+            &mut Input::new(Cursor::new(b"")),
+            &mut layers,
+            EapMethod::Sim,
+            0,
+            true,
+            false,
+        )
+        .expect("configure SIM");
+        assert_eq!(layers, vec![EapLayer::new(EapMethod::Sim)]);
+
+        let mut layers = Vec::new();
+        configure_layer(
+            &mut Input::new(Cursor::new(b"\n\n\n0\n1\n\n")),
+            &mut layers,
+            EapMethod::Peap,
+            0,
+            true,
+            false,
+        )
+        .expect("configure PEAP");
+        assert_eq!(
+            layers.iter().map(|layer| layer.method).collect::<Vec<_>>(),
+            [EapMethod::Peap, EapMethod::Gtc]
+        );
+
+        let mut layers = Vec::new();
+        configure_layer(
+            &mut Input::new(Cursor::new(b"\n\n\n0\n1\n\n")),
+            &mut layers,
+            EapMethod::Ttls,
+            0,
+            true,
+            false,
+        )
+        .expect("configure TTLS");
+        assert_eq!(
+            layers.iter().map(|layer| layer.method).collect::<Vec<_>>(),
+            [EapMethod::Ttls, EapMethod::TunneledPap]
+        );
+    }
+
+    #[test]
+    fn configuration_rejects_excessive_depth_and_omits_credentials() {
+        let error = configure_layer(
+            &mut Input::new(Cursor::new(b"")),
+            &mut Vec::new(),
+            EapMethod::Sim,
+            MAX_EAP_DEPTH + 1,
+            false,
+            false,
+        )
+        .expect_err("depth must be bounded");
+        assert!(matches!(
+            error,
+            AppError::Validation(ValidationError::TooManyEapLayers)
+        ));
+
+        let mut input = Input::new(Cursor::new(b"username\n"));
+        assert_eq!(
+            prompt_identity(&mut input, EapMethod::Mschapv2, false, false)
+                .expect("optional identity"),
+            Some(String::from("username"))
+        );
+        assert_eq!(
+            configure_password(&mut input, EapMethod::Mschapv2, false)
+                .expect("credentials omitted"),
+            (None, None)
+        );
+    }
 }

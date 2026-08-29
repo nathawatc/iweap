@@ -11,6 +11,7 @@ pub const MAX_EAP_LAYERS: usize = MAX_EAP_DEPTH + 1;
 pub const MAX_TEXT_BYTES: usize = 4096;
 pub const MAX_SECRET_BYTES: usize = 4096;
 pub const MAX_DOMAIN_MASK_BYTES: usize = 1024;
+pub const PASSWORD_HASH_HEX_CHARS: usize = 32;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ValidationError {
@@ -44,7 +45,9 @@ impl fmt::Display for ValidationError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let message = match self {
             Self::EmptySsid => "SSID is required",
-            Self::SsidTooLong => "SSID must contain at most 32 bytes",
+            Self::SsidTooLong => {
+                return write!(f, "SSID must contain at most {MAX_SSID_BYTES} bytes");
+            }
             Self::TextTooLong => "profile text value is too long",
             Self::NulInText => "profile text contains an unsupported NUL byte",
             Self::NoEapLayers => "an EAP method is required",
@@ -64,7 +67,12 @@ impl fmt::Display for ValidationError {
             Self::EmptySecret => "stored secret cannot be empty",
             Self::SecretTooLong => "stored secret is too long",
             Self::PasswordHashUnsupported => "password hash is only valid for MSCHAPV2",
-            Self::InvalidPasswordHash => "MSCHAPV2 password hash must be 32 hexadecimal characters",
+            Self::InvalidPasswordHash => {
+                return write!(
+                    f,
+                    "MSCHAPV2 password hash must be {PASSWORD_HASH_HEX_CHARS} hexadecimal characters"
+                );
+            }
             Self::PasswordConflict => "password and password hash cannot both be set",
             Self::CredentialNeedsIdentity => "stored credentials require an identity",
         };
@@ -166,26 +174,54 @@ pub enum EapMethod {
     TunneledMschapv2 = 15,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum MethodKind {
+    Sim,
+    Password,
+    Tls,
+    Tunnel,
+    TunneledPassword,
+}
+
 impl EapMethod {
+    pub const OUTER: &'static [Self] = &[
+        Self::Aka,
+        Self::AkaPrime,
+        Self::Mschapv2,
+        Self::Peap,
+        Self::Pwd,
+        Self::Sim,
+        Self::Tls,
+        Self::Ttls,
+        Self::WfaTls,
+    ];
+    pub const INNER: &'static [Self] = &[
+        Self::Gtc,
+        Self::Md5,
+        Self::Mschapv2,
+        Self::Pwd,
+        Self::Aka,
+        Self::AkaPrime,
+        Self::Peap,
+        Self::Sim,
+        Self::Tls,
+        Self::Ttls,
+        Self::WfaTls,
+    ];
+    pub const TTLS_TUNNELED: &'static [Self] = &[
+        Self::TunneledPap,
+        Self::TunneledChap,
+        Self::TunneledMschap,
+        Self::TunneledMschapv2,
+    ];
+
     pub fn from_wire(value: u8) -> Option<Self> {
-        Some(match value {
-            1 => Self::Aka,
-            2 => Self::AkaPrime,
-            3 => Self::Mschapv2,
-            4 => Self::Peap,
-            5 => Self::Pwd,
-            6 => Self::Sim,
-            7 => Self::Tls,
-            8 => Self::Ttls,
-            9 => Self::WfaTls,
-            10 => Self::Gtc,
-            11 => Self::Md5,
-            12 => Self::TunneledPap,
-            13 => Self::TunneledChap,
-            14 => Self::TunneledMschap,
-            15 => Self::TunneledMschapv2,
-            _ => return None,
-        })
+        Self::OUTER
+            .iter()
+            .chain(Self::INNER)
+            .chain(Self::TTLS_TUNNELED)
+            .copied()
+            .find(|method| method.wire_code() == value)
     }
 
     pub const fn wire_code(self) -> u8 {
@@ -212,46 +248,45 @@ impl EapMethod {
         }
     }
 
-    const fn is_tunneled(self) -> bool {
-        matches!(
-            self,
-            Self::TunneledPap | Self::TunneledChap | Self::TunneledMschap | Self::TunneledMschapv2
-        )
+    pub const fn kind(self) -> MethodKind {
+        match self {
+            Self::Aka | Self::AkaPrime | Self::Sim => MethodKind::Sim,
+            Self::Gtc | Self::Md5 | Self::Mschapv2 | Self::Pwd => MethodKind::Password,
+            Self::Tls | Self::WfaTls => MethodKind::Tls,
+            Self::Peap | Self::Ttls => MethodKind::Tunnel,
+            Self::TunneledPap
+            | Self::TunneledChap
+            | Self::TunneledMschap
+            | Self::TunneledMschapv2 => MethodKind::TunneledPassword,
+        }
     }
 
-    const fn is_password_method(self) -> bool {
-        matches!(self, Self::Gtc | Self::Md5 | Self::Mschapv2 | Self::Pwd)
+    pub fn is_tunneled(self) -> bool {
+        Self::TTLS_TUNNELED.contains(&self)
     }
 
-    const fn is_tls_method(self) -> bool {
-        matches!(self, Self::Tls | Self::WfaTls)
+    pub const fn is_password_method(self) -> bool {
+        matches!(self.kind(), MethodKind::Password)
     }
 
-    const fn is_tunnel_method(self) -> bool {
-        matches!(self, Self::Peap | Self::Ttls)
+    pub const fn is_tls_method(self) -> bool {
+        matches!(self.kind(), MethodKind::Tls)
     }
 
-    const fn is_sim_method(self) -> bool {
-        matches!(self, Self::Aka | Self::AkaPrime | Self::Sim)
+    pub const fn is_tunnel_method(self) -> bool {
+        matches!(self.kind(), MethodKind::Tunnel)
     }
 
-    const fn is_outer_method(self) -> bool {
-        matches!(
-            self,
-            Self::Aka
-                | Self::AkaPrime
-                | Self::Mschapv2
-                | Self::Peap
-                | Self::Pwd
-                | Self::Sim
-                | Self::Tls
-                | Self::Ttls
-                | Self::WfaTls
-        )
+    pub const fn is_sim_method(self) -> bool {
+        matches!(self.kind(), MethodKind::Sim)
     }
 
-    const fn is_inner_method(self) -> bool {
-        !self.is_tunneled()
+    pub fn is_outer_method(self) -> bool {
+        Self::OUTER.contains(&self)
+    }
+
+    pub fn is_inner_method(self) -> bool {
+        Self::INNER.contains(&self)
     }
 }
 
@@ -590,7 +625,7 @@ fn validate_secret_pair(layer: &EapLayer) -> Result<(), ValidationError> {
     }
     if let Some(password_hash) = layer.password_hash.as_ref() {
         validate_secret(password_hash)?;
-        if !is_password_hash(password_hash.as_str()) {
+        if !is_valid_password_hash(password_hash.as_str()) {
             return Err(ValidationError::InvalidPasswordHash);
         }
     }
@@ -687,8 +722,8 @@ pub fn is_valid_domain_mask(mask: &str) -> bool {
     validate_domain_mask(mask).is_ok()
 }
 
-fn is_password_hash(value: &str) -> bool {
-    value.len() == 32 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+pub fn is_valid_password_hash(value: &str) -> bool {
+    value.len() == PASSWORD_HASH_HEX_CHARS && value.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
 pub fn escape_iwd_value(value: &str) -> Result<String, ValidationError> {
@@ -1298,7 +1333,132 @@ mod tests {
     }
 
     #[test]
+    fn tls_wire_round_trips_and_rejects_inconsistent_client_fields() {
+        fn tls_profile(client: TlsClientCredentials, fast: bool) -> Profile {
+            let mut layer = EapLayer::new(EapMethod::Tls);
+            layer.identity = Some(String::from("user"));
+            layer.tls = Some(TlsConfig {
+                ca_cert: Some(PathBuf::from("/etc/ssl/ca.pem")),
+                server_domain_mask: Some(String::from("radius.example.com")),
+                fast_reauthentication: Some(fast),
+                client,
+                client_key_passphrase: None,
+            });
+            profile(vec![layer])
+        }
+
+        for profile in [
+            tls_profile(TlsClientCredentials::None, false),
+            tls_profile(
+                TlsClientCredentials::CertificateAndKey {
+                    certificate: PathBuf::from("/etc/ssl/client.pem"),
+                    key: PathBuf::from("/etc/ssl/client.key"),
+                },
+                true,
+            ),
+            tls_profile(
+                TlsClientCredentials::Pkcs12 {
+                    bundle: PathBuf::from("/etc/ssl/client.p12"),
+                },
+                false,
+            ),
+        ] {
+            let wire = profile.into_wire().expect("encode TLS profile");
+            assert!(Profile::try_from(wire).is_ok());
+        }
+
+        let invalid_tls = [
+            WireTlsConfig {
+                client_kind: 0,
+                client_cert: String::from("/etc/ssl/client.pem"),
+                ..WireTlsConfig::default()
+            },
+            WireTlsConfig {
+                client_kind: 1,
+                ..WireTlsConfig::default()
+            },
+            WireTlsConfig {
+                client_kind: 1,
+                client_cert: String::from("/etc/ssl/client.pem"),
+                client_key: String::from("/etc/ssl/client.key"),
+                client_bundle: String::from("/etc/ssl/client.p12"),
+                ..WireTlsConfig::default()
+            },
+            WireTlsConfig {
+                client_kind: 2,
+                ..WireTlsConfig::default()
+            },
+            WireTlsConfig {
+                client_kind: 2,
+                client_cert: String::from("/etc/ssl/client.pem"),
+                client_bundle: String::from("/etc/ssl/client.p12"),
+                ..WireTlsConfig::default()
+            },
+            WireTlsConfig {
+                client_kind: 3,
+                ..WireTlsConfig::default()
+            },
+        ];
+        for tls in invalid_tls {
+            let wire = WireProfile {
+                ssid: String::from("Office Wi-Fi"),
+                layers: vec![WireEapLayer {
+                    method: EapMethod::Tls.wire_code(),
+                    identity: String::from("user"),
+                    password: Secret::new(""),
+                    password_hash: Secret::new(""),
+                    tls,
+                }],
+            };
+            assert!(matches!(
+                Profile::try_from(wire),
+                Err(ValidationError::InvalidPath | ValidationError::InvalidTlsConfiguration)
+            ));
+        }
+    }
+
+    #[test]
     fn supported_method_names_and_credential_omission_are_stable() {
+        assert_eq!(
+            EapMethod::OUTER,
+            &[
+                EapMethod::Aka,
+                EapMethod::AkaPrime,
+                EapMethod::Mschapv2,
+                EapMethod::Peap,
+                EapMethod::Pwd,
+                EapMethod::Sim,
+                EapMethod::Tls,
+                EapMethod::Ttls,
+                EapMethod::WfaTls,
+            ]
+        );
+        assert_eq!(
+            EapMethod::INNER,
+            &[
+                EapMethod::Gtc,
+                EapMethod::Md5,
+                EapMethod::Mschapv2,
+                EapMethod::Pwd,
+                EapMethod::Aka,
+                EapMethod::AkaPrime,
+                EapMethod::Peap,
+                EapMethod::Sim,
+                EapMethod::Tls,
+                EapMethod::Ttls,
+                EapMethod::WfaTls,
+            ]
+        );
+        assert_eq!(
+            EapMethod::TTLS_TUNNELED,
+            &[
+                EapMethod::TunneledPap,
+                EapMethod::TunneledChap,
+                EapMethod::TunneledMschap,
+                EapMethod::TunneledMschapv2,
+            ]
+        );
+
         let methods = [
             EapMethod::Aka,
             EapMethod::AkaPrime,

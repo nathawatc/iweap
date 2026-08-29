@@ -161,6 +161,7 @@ fn map_install_error(error: InstallError) -> fdo::Error {
 mod tests {
     use super::*;
     use crate::model::{EapMethod, Secret, WireEapLayer, WireProfile, WireTlsConfig};
+    use std::fs;
 
     #[test]
     fn malformed_request_is_rejected_before_authorization_or_filesystem_access() {
@@ -212,5 +213,30 @@ mod tests {
         assert_eq!(activity.active_requests(), 0);
         assert!(activity.stop_if_idle());
         assert!(activity.begin().is_none());
+    }
+
+    #[test]
+    fn inspection_validates_input_and_respects_shutdown_state() {
+        let parent =
+            std::env::temp_dir().join(format!("iweap-service-test-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&parent);
+        fs::create_dir(&parent).expect("create service fixture");
+        let service = InstallerService::new(Installer::for_test(parent.join("iwd")));
+
+        let inspection = zbus::block_on(service.inspect_profile("Office Wi-Fi"))
+            .expect("inspect absent profile");
+        assert_eq!(inspection.filename, "Office Wi-Fi.8021x");
+        assert!(!inspection.state.exists);
+        assert!(matches!(
+            zbus::block_on(service.inspect_profile("")),
+            Err(fdo::Error::InvalidArgs(_))
+        ));
+
+        assert!(service.activity.stop_if_idle());
+        assert!(matches!(
+            zbus::block_on(service.inspect_profile("Office Wi-Fi")),
+            Err(fdo::Error::Failed(_))
+        ));
+        fs::remove_dir_all(parent).expect("remove service fixture");
     }
 }

@@ -1,27 +1,13 @@
-# iweap
+# IWEAP
 
-Interactive Rust generator and installer for IWD 802.1X profiles.
-
-## Architecture
-
-`iweap` runs as the invoking user. It builds and previews a typed EAP model,
-then sends `InstallProfile` over the system D-Bus. D-Bus activation is fail-closed:
-direct D-Bus execution of the root service is disabled, and systemd must launch
-`iweap-service` through its hardened unit. The service checks the caller with
-Polkit action `org.codeberg.iweap.install-profile`, validates the request again,
-and writes only `/var/lib/iwd`.
-
-No `sudo`, `doas`, `pkexec`, `run0`, shell command, or setuid helper is used.
-Read-only profile inspection does not require authorization. Installation does.
+Interactive generator and installer for IWD 802.1X profiles.
 
 ## Build
 
-Requires Rust 1.87 or newer on Linux.
+Requires Linux, Rust 1.87+, IWD, systemd, D-Bus, Polkit, and a Polkit
+authentication agent.
 
 ```sh
-cargo fmt --check
-cargo clippy --all-targets --all-features -- -D warnings
-cargo test --all-targets --all-features
 cargo build --release
 ```
 
@@ -43,19 +29,7 @@ install -Dm644 data/systemd/org.codeberg.iweap.service \
 systemctl daemon-reload
 ```
 
-The system bus must have a Polkit authority and an authentication agent for
-the active user session. The unit is D-Bus activated; do not enable it as a
-boot service. Its D-Bus activation entry fails closed and delegates launch to
-systemd, so the root service always receives the unit sandbox. `StateDirectory=iwd`
-creates `/var/lib/iwd` before the strict service namespace is built, keeps it
-persistent, and sets the directory mode
-to `0700`, matching IWD and the installer. The service runs as root because it
-must write IWD state; its unit bounds capabilities and writable paths. When an
-existing state directory has a different owner or group, systemd recursively
-aligns ownership below it, so deployment assumes IWD's normal root-owned
-`/var/lib/iwd`. Existing root-owned contents are not otherwise reset. The
-service exits after 60 seconds without D-Bus activity and is reactivated on a
-later request.
+Service is D-Bus activated; do not enable it at boot.
 
 ## Use
 
@@ -64,28 +38,22 @@ iweap
 iweap --dry-run
 ```
 
-`--dry-run` prints a redacted IWD profile and never contacts D-Bus or writes
-files. Supported outer methods: AKA, AKA', MSCHAPV2, PEAP, PWD, SIM, TLS,
-TTLS, and current-IWD expanded WFA-TLS. PEAP and TTLS phase-2 methods follow
-current IWD profile keys. Profile names follow IWD's safe-SSID rule; unsafe
-SSID bytes use lowercase hexadecimal.
+`--dry-run` prints a redacted profile without contacting D-Bus or writing files.
 
-Secrets are read from `/dev/tty` with terminal echo disabled. Echo is restored
-on success, input failure, and handled interruption. Stored secrets never
-appear in preview, command arguments, environment, or application logs.
+Supported outer methods: AKA, AKA', MSCHAPV2, PEAP, PWD, SIM, TLS, TTLS, and
+WFA-TLS. PEAP and TTLS phase-2 methods are also supported.
 
-## Storage and overwrite safety
+## Credentials
 
-Credentials are omitted by default so IWD can request them from its agent.
-When selected, IWD-compatible profile secrets remain plaintext at rest in
-`/var/lib/iwd`; the root-owned directory is mode `0700` and each profile is
-root-owned mode `0600`.
+Credentials are omitted by default so IWD can request them when connecting.
+Stored credentials remain plaintext in root-owned mode `0600` profiles under
+`/var/lib/iwd` and never appear in previews or logs.
 
-TLS certificate and key paths are referenced, not copied. They must remain
-accessible to IWD when the profile is used. The installer rejects referenced
-files it cannot validate from its service namespace; this does not guarantee
-that IWD can access them when it uses the profile. Installation uses
-descriptor-relative operations, no-follow destination inspection, exclusive
-temporary files, fsync, and atomic rename. The client sends an exact file
-identity/timestamp token; stale or unexpected destinations are rejected.
-Overwrite confirmation is explicit.
+TLS certificate and key paths are referenced, not copied, and must remain
+accessible to IWD. Existing profiles require explicit overwrite confirmation.
+
+## Troubleshooting
+
+- No authentication prompt: verify Polkit and desktop authentication agent run.
+- Service activation fails: verify install paths, then run `systemctl daemon-reload`.
+- TLS path rejected: use an absolute path to a regular file readable by IWD.
