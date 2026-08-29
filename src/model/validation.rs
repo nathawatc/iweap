@@ -598,6 +598,10 @@ mod tests {
             profile(vec![invalid_outer]).validate(),
             Err(ValidationError::InvalidOuterMethod)
         );
+        assert_eq!(
+            profile(vec![EapLayer::new(EapMethod::TunneledPap)]).validate(),
+            Err(ValidationError::InvalidOuterMethod)
+        );
 
         let mut peap = EapLayer::new(EapMethod::Peap);
         peap.tls = Some(empty_tls());
