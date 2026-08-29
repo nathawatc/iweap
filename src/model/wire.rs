@@ -16,6 +16,7 @@ pub struct WireEapLayer {
     pub identity: String,
     pub password: Secret,
     pub password_hash: Secret,
+    pub has_tls: bool,
     pub tls: WireTlsConfig,
 }
 
@@ -48,6 +49,7 @@ impl Default for WireTlsConfig {
 
 impl WireEapLayer {
     fn from_layer(layer: EapLayer) -> Result<Self, ValidationError> {
+        let has_tls = layer.tls.is_some();
         let tls = layer
             .tls
             .map(WireTlsConfig::from_tls)
@@ -58,6 +60,7 @@ impl WireEapLayer {
             identity: layer.identity.unwrap_or_default(),
             password: layer.password.unwrap_or_else(|| Secret::new("")),
             password_hash: layer.password_hash.unwrap_or_else(|| Secret::new("")),
+            has_tls,
             tls,
         })
     }
@@ -185,10 +188,13 @@ impl TryFrom<WireEapLayer> for EapLayer {
         let identity = optional_text(value.identity);
         let password = optional_secret(value.password);
         let password_hash = optional_secret(value.password_hash);
-        let tls = if value.tls == WireTlsConfig::default() {
-            None
-        } else {
+        let tls = if value.has_tls {
             Some(value.tls.into_tls()?)
+        } else {
+            if value.tls != WireTlsConfig::default() {
+                return Err(ValidationError::InvalidTlsConfiguration);
+            }
+            None
         };
         Ok(Self {
             method,
@@ -272,6 +278,7 @@ mod tests {
         let mut wire = profile(vec![password_layer(EapMethod::Mschapv2, "user", "secret")])
             .into_wire()
             .expect("valid profile");
+        wire.layers[0].has_tls = true;
         wire.layers[0].tls.fast_reauthentication = 2;
         assert_eq!(
             Profile::try_from(wire),
@@ -354,6 +361,7 @@ mod tests {
                     identity: String::from("user"),
                     password: Secret::new(""),
                     password_hash: Secret::new(""),
+                    has_tls: true,
                     tls,
                 }],
             };
@@ -362,5 +370,417 @@ mod tests {
                 Err(ValidationError::InvalidPath | ValidationError::InvalidTlsConfiguration)
             ));
         }
+    }
+
+    fn empty_tls() -> TlsConfig {
+        TlsConfig {
+            ca_cert: None,
+            server_domain_mask: None,
+            fast_reauthentication: None,
+            client: TlsClientCredentials::None,
+            client_key_passphrase: None,
+        }
+    }
+
+    fn clone_tls(tls: &TlsConfig) -> TlsConfig {
+        TlsConfig {
+            ca_cert: tls.ca_cert.clone(),
+            server_domain_mask: tls.server_domain_mask.clone(),
+            fast_reauthentication: tls.fast_reauthentication,
+            client: match &tls.client {
+                TlsClientCredentials::None => TlsClientCredentials::None,
+                TlsClientCredentials::CertificateAndKey { certificate, key } => {
+                    TlsClientCredentials::CertificateAndKey {
+                        certificate: certificate.clone(),
+                        key: key.clone(),
+                    }
+                }
+                TlsClientCredentials::Pkcs12 { bundle } => TlsClientCredentials::Pkcs12 {
+                    bundle: bundle.clone(),
+                },
+            },
+            client_key_passphrase: tls
+                .client_key_passphrase
+                .as_ref()
+                .map(|s| Secret::new(s.as_str())),
+        }
+    }
+
+    fn clone_layer(layer: &EapLayer) -> EapLayer {
+        let mut cloned = EapLayer::new(layer.method);
+        cloned.identity = layer.identity.clone();
+        cloned.password = layer.password.as_ref().map(|s| Secret::new(s.as_str()));
+        cloned.password_hash = layer
+            .password_hash
+            .as_ref()
+            .map(|s| Secret::new(s.as_str()));
+        cloned.tls = layer.tls.as_ref().map(clone_tls);
+        cloned
+    }
+
+    fn clone_profile(p: &Profile) -> Profile {
+        Profile::new(p.ssid.clone(), p.layers.iter().map(clone_layer).collect())
+    }
+
+    #[test]
+    fn dbus_wire_signature_explicitly_includes_has_tls_discriminator() {
+        assert_eq!(
+            <WireEapLayer as Type>::SIGNATURE.to_string(),
+            "(ysssb(ssnyssss))"
+        );
+        assert_eq!(
+            <WireProfile as Type>::SIGNATURE.to_string(),
+            "(sa(ysssb(ssnyssss)))"
+        );
+    }
+
+    #[test]
+    fn regression_p1_1_tls_none_round_trips_distinctly() {
+        let original_layer = password_layer(EapMethod::Mschapv2, "user", "secret");
+        assert_eq!(original_layer.tls, None);
+
+        let wire_layer =
+            WireEapLayer::from_layer(password_layer(EapMethod::Mschapv2, "user", "secret"))
+                .expect("encode layer without TLS");
+        assert!(!wire_layer.has_tls);
+        assert_eq!(wire_layer.tls, WireTlsConfig::default());
+
+        let decoded_layer = EapLayer::try_from(wire_layer).expect("decode layer without TLS");
+        assert_eq!(decoded_layer.tls, None);
+        assert_eq!(decoded_layer, original_layer);
+
+        let original_profile = profile(vec![password_layer(EapMethod::Mschapv2, "user", "secret")]);
+        let wire_profile = profile(vec![password_layer(EapMethod::Mschapv2, "user", "secret")])
+            .into_wire()
+            .expect("encode profile without TLS");
+        assert!(!wire_profile.layers[0].has_tls);
+        assert_eq!(wire_profile.layers[0].tls, WireTlsConfig::default());
+
+        let decoded_profile = Profile::try_from(wire_profile).expect("decode profile without TLS");
+        assert_eq!(decoded_profile, original_profile);
+        assert_eq!(decoded_profile.layers[0].tls, None);
+    }
+
+    #[test]
+    fn regression_p1_1_empty_tls_round_trips_distinctly_from_none() {
+        let make_layer = || {
+            let mut layer = EapLayer::new(EapMethod::Tls);
+            layer.identity = Some(String::from("user"));
+            layer.tls = Some(empty_tls());
+            layer
+        };
+        let original_layer = make_layer();
+        assert_eq!(original_layer.tls, Some(empty_tls()));
+
+        let wire_layer =
+            WireEapLayer::from_layer(make_layer()).expect("encode layer with empty TLS");
+        assert!(wire_layer.has_tls);
+        assert_eq!(wire_layer.tls, WireTlsConfig::default());
+
+        let decoded_layer = EapLayer::try_from(wire_layer).expect("decode layer with empty TLS");
+        assert_eq!(decoded_layer.tls, Some(empty_tls()));
+        assert_eq!(decoded_layer, original_layer);
+
+        let make_profile = || profile(vec![make_layer()]);
+        let original_profile = make_profile();
+        let wire_profile = make_profile()
+            .into_wire()
+            .expect("encode profile with empty TLS");
+        assert!(wire_profile.layers[0].has_tls);
+        assert_eq!(wire_profile.layers[0].tls, WireTlsConfig::default());
+
+        let decoded_profile =
+            Profile::try_from(wire_profile).expect("decode profile with empty TLS");
+        assert_eq!(decoded_profile, original_profile);
+        assert_eq!(decoded_profile.layers[0].tls, Some(empty_tls()));
+
+        // Semantic distinction: None and Some(empty) encode with different discriminators
+        let none_layer = {
+            let mut layer = EapLayer::new(EapMethod::Tls);
+            layer.identity = Some(String::from("user"));
+            layer.tls = None;
+            layer
+        };
+        let wire_none = WireEapLayer::from_layer(none_layer).expect("encode layer with None TLS");
+        let wire_some =
+            WireEapLayer::from_layer(make_layer()).expect("encode layer with Some(empty) TLS");
+        assert_ne!(wire_none.has_tls, wire_some.has_tls);
+        assert!(!wire_none.has_tls);
+        assert!(wire_some.has_tls);
+        assert_eq!(wire_none.tls, wire_some.tls);
+    }
+
+    #[test]
+    fn regression_p1_1_non_empty_tls_round_trips_faithfully() {
+        let test_cases = [
+            TlsConfig {
+                ca_cert: Some(PathBuf::from("/etc/ssl/ca.pem")),
+                server_domain_mask: Some(String::from("radius.example.com")),
+                fast_reauthentication: Some(true),
+                client: TlsClientCredentials::CertificateAndKey {
+                    certificate: PathBuf::from("/etc/ssl/client.pem"),
+                    key: PathBuf::from("/etc/ssl/client.key"),
+                },
+                client_key_passphrase: Some(Secret::new("client_pass")),
+            },
+            TlsConfig {
+                ca_cert: Some(PathBuf::from("/etc/ssl/ca.pem")),
+                server_domain_mask: Some(String::from("auth.example.org")),
+                fast_reauthentication: Some(false),
+                client: TlsClientCredentials::Pkcs12 {
+                    bundle: PathBuf::from("/etc/ssl/client.p12"),
+                },
+                client_key_passphrase: Some(Secret::new("p12_pass")),
+            },
+            TlsConfig {
+                ca_cert: Some(PathBuf::from("/etc/ssl/ca.pem")),
+                server_domain_mask: None,
+                fast_reauthentication: None,
+                client: TlsClientCredentials::None,
+                client_key_passphrase: None,
+            },
+        ];
+
+        for config in test_cases {
+            let make_layer = || {
+                let mut layer = EapLayer::new(EapMethod::Tls);
+                layer.identity = Some(String::from("user"));
+                layer.tls = Some(clone_tls(&config));
+                layer
+            };
+
+            let original_layer = make_layer();
+            let wire_layer = WireEapLayer::from_layer(make_layer()).expect("encode layer");
+            assert!(wire_layer.has_tls);
+            let decoded_layer = EapLayer::try_from(wire_layer).expect("decode layer");
+            assert_eq!(decoded_layer, original_layer);
+
+            let original_profile = profile(vec![make_layer()]);
+            let wire_profile = profile(vec![make_layer()])
+                .into_wire()
+                .expect("encode profile");
+            assert!(wire_profile.layers[0].has_tls);
+            let decoded_profile = Profile::try_from(wire_profile).expect("decode profile");
+            assert_eq!(decoded_profile, original_profile);
+        }
+    }
+
+    #[test]
+    fn regression_p1_1_tls_based_methods_with_empty_tls_round_trip() {
+        let profiles = [
+            // TLS
+            profile(vec![{
+                let mut layer = EapLayer::new(EapMethod::Tls);
+                layer.identity = Some(String::from("user"));
+                layer.tls = Some(empty_tls());
+                layer
+            }]),
+            // WFA-TLS
+            profile(vec![{
+                let mut layer = EapLayer::new(EapMethod::WfaTls);
+                layer.identity = Some(String::from("user"));
+                layer.tls = Some(empty_tls());
+                layer
+            }]),
+            // PEAP (valid phase 2)
+            profile(vec![
+                {
+                    let mut layer = EapLayer::new(EapMethod::Peap);
+                    layer.identity = Some(String::from("user"));
+                    layer.tls = Some(empty_tls());
+                    layer
+                },
+                password_layer(EapMethod::Mschapv2, "inner_user", "password"),
+            ]),
+            // TTLS (valid phase 2)
+            profile(vec![
+                {
+                    let mut layer = EapLayer::new(EapMethod::Ttls);
+                    layer.identity = Some(String::from("user"));
+                    layer.tls = Some(empty_tls());
+                    layer
+                },
+                password_layer(EapMethod::TunneledPap, "inner_user", "password"),
+            ]),
+        ];
+
+        for original in profiles {
+            assert!(original.validate().is_ok());
+            let wire = clone_profile(&original)
+                .into_wire()
+                .expect("encode profile");
+
+            assert!(wire.layers[0].has_tls);
+            assert_eq!(wire.layers[0].tls, WireTlsConfig::default());
+
+            let decoded = Profile::try_from(wire).expect("round trip profile");
+            assert_eq!(decoded, original);
+            assert_eq!(decoded.layers[0].tls, Some(empty_tls()));
+            assert!(decoded.validate().is_ok());
+        }
+    }
+
+    #[test]
+    fn regression_p1_1_malformed_wire_state_rejects_non_default_tls_when_has_tls_false() {
+        let non_default_payloads = [
+            WireTlsConfig {
+                fast_reauthentication: 1,
+                ..WireTlsConfig::default()
+            },
+            WireTlsConfig {
+                fast_reauthentication: 0,
+                ..WireTlsConfig::default()
+            },
+            WireTlsConfig {
+                ca_cert: String::from("/etc/ssl/ca.pem"),
+                ..WireTlsConfig::default()
+            },
+            WireTlsConfig {
+                server_domain_mask: String::from("radius.example.com"),
+                ..WireTlsConfig::default()
+            },
+            WireTlsConfig {
+                client_kind: 1,
+                client_cert: String::from("/etc/ssl/client.pem"),
+                client_key: String::from("/etc/ssl/client.key"),
+                ..WireTlsConfig::default()
+            },
+            WireTlsConfig {
+                client_kind: 2,
+                client_bundle: String::from("/etc/ssl/client.p12"),
+                ..WireTlsConfig::default()
+            },
+            WireTlsConfig {
+                client_key_passphrase: Secret::new("passphrase"),
+                ..WireTlsConfig::default()
+            },
+        ];
+
+        for tls in non_default_payloads {
+            let wire_layer = WireEapLayer {
+                method: EapMethod::Tls.wire_code(),
+                identity: String::from("user"),
+                password: Secret::new(""),
+                password_hash: Secret::new(""),
+                has_tls: false,
+                tls,
+            };
+            assert_eq!(
+                EapLayer::try_from(wire_layer),
+                Err(ValidationError::InvalidTlsConfiguration)
+            );
+        }
+
+        let wire_profile = WireProfile {
+            ssid: String::from("Office Wi-Fi"),
+            layers: vec![WireEapLayer {
+                method: EapMethod::Tls.wire_code(),
+                identity: String::from("user"),
+                password: Secret::new(""),
+                password_hash: Secret::new(""),
+                has_tls: false,
+                tls: WireTlsConfig {
+                    fast_reauthentication: 1,
+                    ..WireTlsConfig::default()
+                },
+            }],
+        };
+        assert_eq!(
+            Profile::try_from(wire_profile),
+            Err(ValidationError::InvalidTlsConfiguration)
+        );
+    }
+
+    #[test]
+    fn regression_p1_1_preserves_semantic_validation_without_wire_decoder_policy() {
+        // TLS-based methods with has_tls = false decode faithfully to tls: None
+        for method in [
+            EapMethod::Tls,
+            EapMethod::WfaTls,
+            EapMethod::Peap,
+            EapMethod::Ttls,
+        ] {
+            let wire_layer = WireEapLayer {
+                method: method.wire_code(),
+                identity: String::from("user"),
+                password: Secret::new(""),
+                password_hash: Secret::new(""),
+                has_tls: false,
+                tls: WireTlsConfig::default(),
+            };
+            // Wire decoder must NOT enforce EAP semantics: decoding succeeds with tls: None
+            let decoded_layer = EapLayer::try_from(wire_layer).expect("wire decoding succeeds");
+            assert_eq!(decoded_layer.method, method);
+            assert_eq!(decoded_layer.tls, None);
+
+            // Normal domain validation subsequently rejects it
+            let layers = if method.is_tunnel_method() {
+                vec![
+                    WireEapLayer {
+                        method: method.wire_code(),
+                        identity: String::from("user"),
+                        password: Secret::new(""),
+                        password_hash: Secret::new(""),
+                        has_tls: false,
+                        tls: WireTlsConfig::default(),
+                    },
+                    WireEapLayer {
+                        method: EapMethod::Mschapv2.wire_code(),
+                        identity: String::from("inner"),
+                        password: Secret::new("password"),
+                        password_hash: Secret::new(""),
+                        has_tls: false,
+                        tls: WireTlsConfig::default(),
+                    },
+                ]
+            } else {
+                vec![WireEapLayer {
+                    method: method.wire_code(),
+                    identity: String::from("user"),
+                    password: Secret::new(""),
+                    password_hash: Secret::new(""),
+                    has_tls: false,
+                    tls: WireTlsConfig::default(),
+                }]
+            };
+            let wire_profile = WireProfile {
+                ssid: String::from("Office Wi-Fi"),
+                layers,
+            };
+            assert_eq!(
+                Profile::try_from(wire_profile),
+                Err(ValidationError::MissingTlsConfiguration)
+            );
+        }
+
+        // Non-TLS method with has_tls = true decodes faithfully to Some(...)
+        let wire_layer = WireEapLayer {
+            method: EapMethod::Sim.wire_code(),
+            identity: String::new(),
+            password: Secret::new(""),
+            password_hash: Secret::new(""),
+            has_tls: true,
+            tls: WireTlsConfig::default(),
+        };
+        let decoded_layer = EapLayer::try_from(wire_layer).expect("wire decoding succeeds");
+        assert_eq!(decoded_layer.method, EapMethod::Sim);
+        assert_eq!(decoded_layer.tls, Some(empty_tls()));
+
+        // Normal domain validation determines SIM cannot have TLS
+        let wire_profile = WireProfile {
+            ssid: String::from("Office Wi-Fi"),
+            layers: vec![WireEapLayer {
+                method: EapMethod::Sim.wire_code(),
+                identity: String::new(),
+                password: Secret::new(""),
+                password_hash: Secret::new(""),
+                has_tls: true,
+                tls: WireTlsConfig::default(),
+            }],
+        };
+        assert_eq!(
+            Profile::try_from(wire_profile),
+            Err(ValidationError::MethodHasUnexpectedFields)
+        );
     }
 }

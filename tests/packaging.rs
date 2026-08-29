@@ -99,4 +99,14 @@ fn cross_format_service_contract_is_synchronized() {
         assert!(bus_policy.contains(&format!("send_member=\"{member}\"")));
         assert!(introspection.contains(&format!("<method name=\"{member}\">")));
     }
+
+    use zbus::zvariant::Type;
+    let install_request_sig = <iweap::InstallRequest as Type>::SIGNATURE.to_string();
+    assert_eq!(
+        install_request_sig,
+        "((sa(ysssb(ssnyssss)))(btttuuuxxtxt)b)"
+    );
+    let install_arg =
+        format!("<arg name=\"request\" type=\"{install_request_sig}\" direction=\"in\"/>");
+    assert!(introspection.contains(&install_arg));
 }
