@@ -3,8 +3,8 @@
 	"http://www.freedesktop.org/standards/PolicyKit/1.0/policyconfig.dtd">
 <policyconfig>
 	<action id="org.codeberg.iweap.install-profile">
-		<description>Install an IWD 802.1X profile</description>
-		<message>Authentication is required to install an IWD 802.1X profile.</message>
+		<description>Inspect or install an IWD 802.1X profile</description>
+		<message>Authentication is required to inspect or install an IWD 802.1X profile.</message>
 		<defaults>
 			<allow_any>no</allow_any>
 			<allow_inactive>no</allow_inactive>

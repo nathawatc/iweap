@@ -1,6 +1,6 @@
 use crate::filesystem::{InstallError, Installer};
 use crate::ipc::authorize_system_bus_name;
-use crate::model::{InstallRequest, Profile, ProfileInspection};
+use crate::model::{InstallRequest, Profile, ProfileInspection, validate_ssid};
 use std::sync::{Arc, Mutex};
 use zbus::fdo;
 use zbus::message::Header;
@@ -45,6 +45,15 @@ impl InstallerService {
         self.activity
             .begin()
             .ok_or_else(|| fdo::Error::Failed(String::from("service is shutting down")))
+    }
+
+    fn inspect_profile_authorized(&self, ssid: &str) -> fdo::Result<ProfileInspection> {
+        let installer = self
+            .installer
+            .lock()
+            .map_err(|_| fdo::Error::Failed(String::from("installer state unavailable")))?;
+        let (filename, state) = installer.inspect(ssid).map_err(map_install_error)?;
+        Ok(ProfileInspection { filename, state })
     }
 }
 
@@ -99,14 +108,18 @@ impl Drop for RequestGuard {
 
 #[zbus::interface(name = "org.codeberg.iweap1.ProfileInstaller")]
 impl InstallerService {
-    async fn inspect_profile(&self, ssid: &str) -> fdo::Result<ProfileInspection> {
+    async fn inspect_profile(
+        &self,
+        ssid: &str,
+        #[zbus(header)] header: Header<'_>,
+    ) -> fdo::Result<ProfileInspection> {
         let _request = self.request_guard()?;
-        let installer = self
-            .installer
-            .lock()
-            .map_err(|_| fdo::Error::Failed(String::from("installer state unavailable")))?;
-        let (filename, state) = installer.inspect(ssid).map_err(map_install_error)?;
-        Ok(ProfileInspection { filename, state })
+        let sender = sender_from_header(&header)?;
+        validate_inspection_input(ssid)?;
+        authorize_system_bus_name(&sender)
+            .await
+            .map_err(map_authorization_error)?;
+        self.inspect_profile_authorized(ssid)
     }
 
     async fn install_profile(
@@ -115,19 +128,11 @@ impl InstallerService {
         #[zbus(header)] header: Header<'_>,
     ) -> fdo::Result<String> {
         let _request = self.request_guard()?;
-        let sender = header
-            .sender()
-            .ok_or_else(|| fdo::Error::AccessDenied(String::from("missing D-Bus caller identity")))?
-            .to_string();
+        let sender = sender_from_header(&header)?;
         let (profile, expected_state, overwrite) = validate_request(request)?;
         authorize_system_bus_name(&sender)
             .await
-            .map_err(|error| match error {
-                crate::ipc::AuthorizationError::Denied => {
-                    fdo::Error::AccessDenied(String::from("authorization denied"))
-                }
-                crate::ipc::AuthorizationError::Bus(error) => fdo::Error::Failed(error.to_string()),
-            })?;
+            .map_err(map_authorization_error)?;
 
         let installer = self
             .installer
@@ -136,6 +141,26 @@ impl InstallerService {
         installer
             .install(&profile, expected_state, overwrite)
             .map_err(map_install_error)
+    }
+}
+
+fn sender_from_header(header: &Header<'_>) -> fdo::Result<String> {
+    header
+        .sender()
+        .ok_or_else(|| fdo::Error::AccessDenied(String::from("missing D-Bus caller identity")))
+        .map(ToString::to_string)
+}
+
+fn validate_inspection_input(ssid: &str) -> fdo::Result<()> {
+    validate_ssid(ssid).map_err(map_validation_error)
+}
+
+fn map_authorization_error(error: crate::ipc::AuthorizationError) -> fdo::Error {
+    match error {
+        crate::ipc::AuthorizationError::Denied => {
+            fdo::Error::AccessDenied(String::from("authorization denied"))
+        }
+        crate::ipc::AuthorizationError::Bus(error) => fdo::Error::Failed(error.to_string()),
     }
 }
 
@@ -205,6 +230,34 @@ mod tests {
     }
 
     #[test]
+    fn inspection_fails_closed_without_caller_identity() {
+        let service = InstallerService::new(Installer::system());
+        let message = zbus::message::Message::method_call("/org/codeberg/iweap", "InspectProfile")
+            .expect("build inspection message")
+            .build(&())
+            .expect("build inspection message");
+
+        assert!(matches!(
+            zbus::block_on(service.inspect_profile("Office Wi-Fi", message.header())),
+            Err(fdo::Error::AccessDenied(_))
+        ));
+    }
+
+    #[test]
+    fn authorization_errors_fail_closed() {
+        assert!(matches!(
+            map_authorization_error(crate::ipc::AuthorizationError::Denied),
+            fdo::Error::AccessDenied(_)
+        ));
+        assert!(matches!(
+            map_authorization_error(crate::ipc::AuthorizationError::Bus(
+                zbus::Error::Unsupported
+            )),
+            fdo::Error::Failed(_)
+        ));
+    }
+
+    #[test]
     fn idle_shutdown_rejects_new_requests_after_active_work_finishes() {
         let service = InstallerService::new(Installer::system());
         let activity = service.activity();
@@ -225,18 +278,36 @@ mod tests {
         fs::create_dir(&parent).expect("create service fixture");
         let service = InstallerService::new(Installer::for_test(parent.join("iwd")));
 
-        let inspection = zbus::block_on(service.inspect_profile("Office Wi-Fi"))
+        let inspection = service
+            .inspect_profile_authorized("Office Wi-Fi")
             .expect("inspect absent profile");
         assert_eq!(inspection.filename, "Office Wi-Fi.8021x");
         assert!(!inspection.state.exists);
         assert!(matches!(
-            zbus::block_on(service.inspect_profile("")),
+            validate_inspection_input(""),
+            Err(fdo::Error::InvalidArgs(_))
+        ));
+
+        let invalid_message =
+            zbus::message::Message::method_call("/org/codeberg/iweap", "InspectProfile")
+                .expect("build invalid inspection message")
+                .sender(":1.42")
+                .expect("set inspection sender")
+                .build(&())
+                .expect("build invalid inspection message");
+        assert!(matches!(
+            zbus::block_on(service.inspect_profile("", invalid_message.header())),
             Err(fdo::Error::InvalidArgs(_))
         ));
 
         assert!(service.activity.stop_if_idle());
+        let shutdown_message =
+            zbus::message::Message::method_call("/org/codeberg/iweap", "InspectProfile")
+                .expect("build shutdown inspection message")
+                .build(&())
+                .expect("build shutdown inspection message");
         assert!(matches!(
-            zbus::block_on(service.inspect_profile("Office Wi-Fi")),
+            zbus::block_on(service.inspect_profile("Office Wi-Fi", shutdown_message.header())),
             Err(fdo::Error::Failed(_))
         ));
         fs::remove_dir_all(parent).expect("remove service fixture");

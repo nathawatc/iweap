@@ -259,6 +259,25 @@ fn configure_layer<R: BufRead>(
         MethodKind::Sim => {}
         MethodKind::Password => {
             layer.identity = prompt_identity(input, method, outer, store_credentials)?;
+            if method == EapMethod::Mschapv2 && !store_credentials && !layers.is_empty() {
+                loop {
+                    let identity_present = layer.identity.is_some();
+                    if !identity_present
+                        || iweap::model::is_eap_method_supported_for_layers_with_identity(
+                            method,
+                            layers,
+                            store_credentials,
+                            identity_present,
+                        )
+                    {
+                        break;
+                    }
+                    eprintln!(
+                        "Identity cannot be stored for MSCHAPV2 at this nesting depth; leave it blank to use IWD agent."
+                    );
+                    layer.identity = prompt_identity(input, method, outer, store_credentials)?;
+                }
+            }
             let (password, password_hash) = configure_password(input, method, store_credentials)?;
             layer.password = password;
             layer.password_hash = password_hash;
@@ -568,6 +587,38 @@ mod tests {
             select_inner_eap_method(&mut input, &existing_layers, true)
                 .expect("stored-compatible method"),
             EapMethod::Pwd
+        );
+    }
+
+    #[test]
+    fn cli_reprompts_incompatible_deep_agent_mschapv2_identity() {
+        let existing_layers = nested_peap_layers(4);
+        let mut selection_input = Input::new(Cursor::new(b"3\n"));
+        assert_eq!(
+            select_inner_eap_method(&mut selection_input, &existing_layers, false)
+                .expect("agent-compatible method"),
+            EapMethod::Mschapv2
+        );
+
+        let mut input = Input::new(Cursor::new(b"user\n\n"));
+        let mut layers = existing_layers;
+        configure_layer(
+            &mut input,
+            &mut layers,
+            EapMethod::Mschapv2,
+            4,
+            false,
+            false,
+        )
+        .expect("reprompt until identity is omitted");
+
+        assert_eq!(
+            layers.last().and_then(|layer| layer.identity.as_deref()),
+            None
+        );
+        assert_eq!(
+            Profile::new(String::from("Office Wi-Fi"), layers).validate(),
+            Ok(())
         );
     }
 

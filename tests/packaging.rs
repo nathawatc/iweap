@@ -16,6 +16,19 @@ fn setting<'a>(contents: &'a str, key: &str) -> Option<&'a str> {
     })
 }
 
+fn method_block<'a>(introspection: &'a str, name: &str) -> &'a str {
+    let marker = format!("<method name=\"{name}\">");
+    let start = introspection
+        .find(&marker)
+        .expect("method in introspection");
+    let remainder = &introspection[start..];
+    let end = remainder
+        .find("</method>")
+        .expect("method closing tag in introspection")
+        + "</method>".len();
+    &remainder[..end]
+}
+
 #[test]
 fn cross_format_service_contract_is_synchronized() {
     let bus_policy = data_file("dbus/org.codeberg.iweap.conf");
@@ -50,6 +63,10 @@ fn cross_format_service_contract_is_synchronized() {
         Some("/usr/lib/iweap/iweap-service")
     );
     assert!(polkit.contains(&format!("<action id=\"{AUTHORIZATION_ACTION}\">")));
+    assert!(polkit.contains("<description>Inspect or install an IWD 802.1X profile</description>"));
+    assert!(polkit.contains(
+        "<message>Authentication is required to inspect or install an IWD 802.1X profile.</message>"
+    ));
 
     assert_eq!(
         setting(&unit, "StateDirectory"),
@@ -95,10 +112,16 @@ fn cross_format_service_contract_is_synchronized() {
         &mut introspection,
         0,
     );
+    assert_eq!(introspection.matches("<method name=").count(), 2);
     for member in ["InspectProfile", "InstallProfile"] {
         assert!(bus_policy.contains(&format!("send_member=\"{member}\"")));
         assert!(introspection.contains(&format!("<method name=\"{member}\">")));
     }
+
+    let inspect_method = method_block(&introspection, "InspectProfile");
+    assert_eq!(inspect_method.matches("<arg ").count(), 2);
+    assert!(inspect_method.contains("<arg name=\"ssid\" type=\"s\" direction=\"in\"/>"));
+    assert!(inspect_method.contains("<arg type=\"(s(btttuuuxxtxt))\" direction=\"out\"/>"));
 
     use zbus::zvariant::Type;
     let install_request_sig = <iweap::InstallRequest as Type>::SIGNATURE.to_string();

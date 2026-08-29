@@ -117,7 +117,7 @@ impl Profile {
         if self.layers.len() > MAX_EAP_LAYERS {
             return Err(ValidationError::TooManyEapLayers);
         }
-        let consumed = self.validate_layer(0, None, 0, IWD_EAP_PREFIX)?;
+        let consumed = self.validate_layer(0, IWD_EAP_PREFIX)?;
         if consumed != self.layers.len() {
             return Err(ValidationError::UnexpectedNestedEap);
         }
@@ -127,25 +127,16 @@ impl Profile {
     fn validate_layer(
         &self,
         index: usize,
-        parent: Option<EapMethod>,
-        depth: usize,
         prefix: &str,
     ) -> Result<usize, ValidationError> {
-        if depth > MAX_EAP_DEPTH {
-            return Err(ValidationError::TooManyEapLayers);
-        }
         let layer = self
             .layers
             .get(index)
             .ok_or(ValidationError::MissingPhase2)?;
 
-        if parent.is_none() {
+        if index == 0 {
             if !layer.method.is_outer_method() {
                 return Err(ValidationError::InvalidOuterMethod);
-            }
-        } else if layer.method.is_tunneled() {
-            if parent != Some(EapMethod::Ttls) {
-                return Err(ValidationError::InvalidTunneledMethod);
             }
         } else if !layer.method.is_inner_method() {
             return Err(ValidationError::InvalidInnerMethod);
@@ -172,7 +163,7 @@ impl Profile {
                 validate_iwd_prefix_compatibility(child, &child_prefix)?;
                 return Ok(child_index + 1);
             }
-            return self.validate_layer(child_index, Some(layer.method), depth + 1, &child_prefix);
+            return self.validate_layer(child_index, &child_prefix);
         }
         if index + 1 != self.layers.len() {
             return Err(ValidationError::UnexpectedNestedEap);
@@ -181,11 +172,7 @@ impl Profile {
     }
 
     fn validate_layer_fields(&self, layer: &EapLayer) -> Result<(), ValidationError> {
-        if layer.method.is_tunneled() {
-            validate_optional_text(layer.identity.as_deref())?;
-        } else {
-            validate_eap_identity(layer.identity.as_deref())?;
-        }
+        validate_eap_identity(layer.identity.as_deref())?;
         if layer.method.is_sim_method() {
             if layer.identity.is_some()
                 || layer.password.is_some()
@@ -221,9 +208,6 @@ impl Profile {
                 return Err(ValidationError::MethodHasUnexpectedFields);
             }
             return tls.validate();
-        }
-        if layer.method.is_tunneled() {
-            return self.validate_tunneled_fields(layer);
         }
         Err(ValidationError::InvalidInnerMethod)
     }
@@ -365,6 +349,15 @@ pub fn is_eap_method_supported_for_layers(
     layers: &[EapLayer],
     store_credentials: bool,
 ) -> bool {
+    is_eap_method_supported_for_layers_with_identity(method, layers, store_credentials, false)
+}
+
+pub fn is_eap_method_supported_for_layers_with_identity(
+    method: EapMethod,
+    layers: &[EapLayer],
+    store_credentials: bool,
+    identity_present: bool,
+) -> bool {
     if layers.is_empty() || layers.iter().any(|layer| !layer.method.is_tunnel_method()) {
         return false;
     }
@@ -377,7 +370,7 @@ pub fn is_eap_method_supported_for_layers(
     }
 
     let prefix = compute_effective_prefix_for_layers(layers);
-    let stored_identity = store_credentials && method.is_password_method();
+    let stored_identity = method.is_password_method() && (identity_present || store_credentials);
     let stored_password = store_credentials && method.is_password_method();
     validate_iwd_method_prefix(method, &prefix, stored_identity, stored_password).is_ok()
 }
@@ -700,6 +693,24 @@ mod tests {
             validate_iwd_prefix_compatibility(&agent, &"a".repeat(56)),
             Err(ValidationError::SettingPrefixTooLong)
         );
+
+        let nested = nested_peap_layers(4);
+        assert!(is_eap_method_supported_for_layers(
+            EapMethod::Mschapv2,
+            &nested,
+            false
+        ));
+        assert!(!is_eap_method_supported_for_layers_with_identity(
+            EapMethod::Mschapv2,
+            &nested,
+            false,
+            true
+        ));
+        assert!(!is_eap_method_supported_for_layers(
+            EapMethod::Mschapv2,
+            &nested,
+            true
+        ));
     }
 
     #[test]
