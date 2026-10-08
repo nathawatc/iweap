@@ -80,13 +80,14 @@ impl<R: BufRead> Input<R> {
 
     pub fn yes_no(&mut self, prompt: &str, default: bool) -> Result<bool, InputError> {
         loop {
-            let mut value = self.line(prompt)?;
-            if value.is_empty() {
-                value = if default { "yes" } else { "no" }.to_owned();
+            let value = self.line(prompt)?;
+            let trimmed = value.trim();
+            if trimmed.is_empty() {
+                return Ok(default);
             }
-            match value.as_str() {
-                "y" | "Y" | "yes" | "YES" | "Yes" => return Ok(true),
-                "n" | "N" | "no" | "NO" | "No" => return Ok(false),
+            match trimmed.to_ascii_lowercase().as_str() {
+                "y" | "yes" => return Ok(true),
+                "n" | "no" => return Ok(false),
                 _ => eprintln!("Answer yes or no."),
             }
         }
@@ -95,10 +96,13 @@ impl<R: BufRead> Input<R> {
     pub fn optional_bool(&mut self, prompt: &str) -> Result<Option<bool>, InputError> {
         loop {
             let value = self.line(prompt)?;
-            match value.as_str() {
-                "" => return Ok(None),
-                "y" | "Y" | "yes" | "YES" | "Yes" => return Ok(Some(true)),
-                "n" | "N" | "no" | "NO" | "No" => return Ok(Some(false)),
+            let trimmed = value.trim();
+            if trimmed.is_empty() {
+                return Ok(None);
+            }
+            match trimmed.to_ascii_lowercase().as_str() {
+                "y" | "yes" => return Ok(Some(true)),
+                "n" | "no" => return Ok(Some(false)),
                 _ => eprintln!("Enter yes, no, or leave blank."),
             }
         }
@@ -221,7 +225,9 @@ mod tests {
 
     #[test]
     fn yes_no_and_optional_bool_accept_shell_compatibility_forms() {
-        let mut input = Input::new(Cursor::new(b"maybe\nyes\nNO\n"));
+        let mut input = Input::new(Cursor::new(b"maybe\n  yes \n  NO  \n  yEs \n  nO \n"));
+        assert_eq!(input.yes_no("yes/no: ", false).ok(), Some(true));
+        assert_eq!(input.optional_bool("bool: ").ok(), Some(Some(false)));
         assert_eq!(input.yes_no("yes/no: ", false).ok(), Some(true));
         assert_eq!(input.optional_bool("bool: ").ok(), Some(Some(false)));
     }

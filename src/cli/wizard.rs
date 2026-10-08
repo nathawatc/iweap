@@ -42,27 +42,43 @@ pub(crate) fn select_method<R: BufRead>(
     methods: &[EapMethod],
     default_method: Option<EapMethod>,
 ) -> Result<EapMethod, AppError> {
-    let default_method = default_method.filter(|d| methods.contains(d));
+    let default_method = default_method
+        .filter(|d| methods.contains(d))
+        .or_else(|| (methods.len() == 1).then(|| methods[0]));
     let tty = is_stderr_tty();
-    loop {
-        eprintln!("\n{title}:");
-        let items: Vec<String> = methods
-            .iter()
-            .enumerate()
-            .map(|(index, method)| {
-                let is_default = Some(*method) == default_method;
-                if is_default && tty {
-                    format!("\x1b[1m{:>3})\x1b[0m {:<10}", index + 1, method.name())
-                } else {
-                    format!("{:>3}) {:<10}", index + 1, method.name())
-                }
-            })
-            .collect();
-        for chunk in items.chunks(3) {
-            eprintln!("  {}", chunk.join("  "));
-        }
 
-        let prompt = format!("Select [1-{}]: ", methods.len());
+    eprintln!("\n{title}:");
+    let max_len = methods.iter().map(|m| m.name().len()).max().unwrap_or(0);
+    let col_width = max_len + 1;
+    let items: Vec<String> = methods
+        .iter()
+        .enumerate()
+        .map(|(index, method)| {
+            let is_default = Some(*method) == default_method;
+            if is_default && tty {
+                format!(
+                    "\x1b[1m{:>3})\x1b[0m {:<width$}",
+                    index + 1,
+                    method.name(),
+                    width = col_width
+                )
+            } else {
+                format!(
+                    "{:>3}) {:<width$}",
+                    index + 1,
+                    method.name(),
+                    width = col_width
+                )
+            }
+        })
+        .collect();
+    let cols = if max_len > 12 { 2 } else { 3 };
+    for chunk in items.chunks(cols) {
+        eprintln!("  {}", chunk.join("  "));
+    }
+
+    let prompt = format!("Select [1-{}]: ", methods.len());
+    loop {
         let line = input.line(&prompt)?;
         let trimmed = line.trim();
         if trimmed.is_empty() {
@@ -96,10 +112,10 @@ pub(crate) fn select_credential_handling<R: BufRead>(
 ) -> Result<bool, AppError> {
     let tty = is_stderr_tty();
     let num_1 = if tty { "\x1b[1m  1)\x1b[0m" } else { "  1)" };
+    eprintln!(
+        "\nCredential storage:\n{num_1} Prompt at connection (recommended)\n  2) Store in profile"
+    );
     loop {
-        eprintln!(
-            "\nCredential storage:\n{num_1} Prompt at connection (recommended)\n  2) Store in profile"
-        );
         match input.line("Select [1-2]: ")?.trim() {
             "" | "1" => return Ok(false),
             "2" => return Ok(true),
@@ -259,10 +275,10 @@ pub(crate) fn configure_password<R: BufRead>(
     if method == EapMethod::Mschapv2 {
         let tty = is_stderr_tty();
         let num_1 = if tty { "\x1b[1m  1)\x1b[0m" } else { "  1)" };
+        eprintln!(
+            "\nMSCHAPV2 credential format:\n{num_1} Password\n  2) MD4 password hash ({PASSWORD_HASH_HEX_CHARS} hex characters)"
+        );
         loop {
-            eprintln!(
-                "\nMSCHAPV2 credential format:\n{num_1} Password\n  2) MD4 password hash ({PASSWORD_HASH_HEX_CHARS} hex characters)"
-            );
             match input.line("Select [1-2]: ")?.trim() {
                 "" | "1" => {
                     return Ok((
@@ -311,6 +327,15 @@ pub(crate) struct TlsCommon {
     pub(crate) fast_reauthentication: Option<bool>,
 }
 
+fn normalize_domain_mask(input: &str) -> String {
+    input
+        .split(';')
+        .map(str::trim)
+        .filter(|segment| !segment.is_empty())
+        .collect::<Vec<_>>()
+        .join(";")
+}
+
 pub(crate) fn configure_tls_common<R: BufRead>(
     input: &mut Input<R>,
 ) -> Result<TlsCommon, AppError> {
@@ -325,10 +350,15 @@ pub(crate) fn configure_tls_common<R: BufRead>(
             let value = input.optional("Server domain mask [optional]: ")?;
             match value {
                 None => break None,
-                Some(value) if iweap::model::is_valid_domain_mask(&value) => break Some(value),
-                Some(_) => eprintln!(
-                    "Invalid domain mask. Use DNS labels, * labels, dots, and semicolons."
-                ),
+                Some(value) => {
+                    let normalized = normalize_domain_mask(&value);
+                    if iweap::model::is_valid_domain_mask(&normalized) {
+                        break Some(normalized);
+                    }
+                    eprintln!(
+                        "Invalid domain mask. Use DNS labels, * labels, dots, and semicolons."
+                    );
+                }
             }
         }
     } else {
@@ -349,10 +379,10 @@ pub(crate) fn configure_tls_client_credentials<R: BufRead>(
 ) -> Result<(TlsClientCredentials, Option<Secret>), AppError> {
     let tty = is_stderr_tty();
     let num_0 = if tty { "\x1b[1m  0)\x1b[0m" } else { "  0)" };
+    eprintln!(
+        "\nTLS client credentials:\n{num_0} None\n  1) Certificate & private key\n  2) PKCS#12 bundle"
+    );
     let client = loop {
-        eprintln!(
-            "\nTLS client credentials:\n{num_0} None\n  1) Certificate & private key\n  2) PKCS#12 bundle"
-        );
         match input.line("Select [0-2]: ")?.trim() {
             "" | "0" => break TlsClientCredentials::None,
             "1" => {
@@ -464,6 +494,29 @@ mod tests {
             configure_tls_client_credentials(&mut input, false).expect("default client creds");
         assert_eq!(client, TlsClientCredentials::None);
         assert_eq!(passphrase, None);
+
+        let mut input = Input::new(Cursor::new(b"\n"));
+        assert_eq!(
+            select_method(&mut input, "Single", &[EapMethod::Tls], None)
+                .expect("sole method default"),
+            EapMethod::Tls
+        );
+
+        let mut input = Input::new(Cursor::new(b"invalid\n\n"));
+        assert_eq!(
+            select_method(&mut input, "Outer", EapMethod::OUTER, Some(EapMethod::Peap))
+                .expect("retry then default"),
+            EapMethod::Peap
+        );
+    }
+
+    #[test]
+    fn domain_mask_normalization_trims_whitespace_and_empty_segments() {
+        assert_eq!(
+            normalize_domain_mask("  radius.example.com; *.corp  ; ; "),
+            "radius.example.com;*.corp"
+        );
+        assert_eq!(normalize_domain_mask(""), "");
     }
 
     #[test]
