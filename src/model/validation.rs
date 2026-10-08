@@ -124,11 +124,7 @@ impl Profile {
         Ok(())
     }
 
-    fn validate_layer(
-        &self,
-        index: usize,
-        prefix: &str,
-    ) -> Result<usize, ValidationError> {
+    fn validate_layer(&self, index: usize, prefix: &str) -> Result<usize, ValidationError> {
         let layer = self
             .layers
             .get(index)
