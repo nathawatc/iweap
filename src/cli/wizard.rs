@@ -39,14 +39,26 @@ pub(crate) fn select_method<R: BufRead>(
             eprintln!("{:>3}) {}", index + 1, method.name());
         }
         let prompt = format!("Select method [1-{}]: ", methods.len());
-        let selection = input.line(&prompt)?.parse::<usize>().ok();
-        if let Some(method) = selection
-            .and_then(|selection| selection.checked_sub(1))
-            .and_then(|index| methods.get(index))
+        let line = input.line(&prompt)?;
+        let trimmed = line.trim();
+        if let Ok(selection) = trimmed.parse::<usize>() {
+            if let Some(method) = selection
+                .checked_sub(1)
+                .and_then(|index| methods.get(index))
+            {
+                return Ok(*method);
+            }
+        }
+        if let Some(method) = methods
+            .iter()
+            .find(|m| m.name().eq_ignore_ascii_case(trimmed))
         {
             return Ok(*method);
         }
-        eprintln!("Choose a number from 1 to {}.", methods.len());
+        eprintln!(
+            "Choose a number from 1 to {} or enter a method name.",
+            methods.len()
+        );
     }
 }
 
@@ -57,8 +69,11 @@ pub(crate) fn select_credential_handling<R: BufRead>(
         eprintln!(
             "\nCredential handling:\n  1) Ask IWD agent at connection time (recommended; do not store secrets)\n  2) Store credentials in profile"
         );
-        match input.line("Select credential handling [1-2]: ")?.as_str() {
-            "1" => return Ok(false),
+        match input
+            .line("Select credential handling [1-2, default: 1]: ")?
+            .as_str()
+        {
+            "" | "1" => return Ok(false),
             "2" => return Ok(true),
             _ => eprintln!("Choose 1 or 2."),
         }
@@ -221,8 +236,11 @@ pub(crate) fn configure_password<R: BufRead>(
             eprintln!(
                 "\nMSCHAPV2 credential format:\n  1) Password (IWD derives the NT hash)\n  2) Existing {PASSWORD_HASH_HEX_CHARS}-hex-character MD4 password hash"
             );
-            match input.line("Select credential format [1-2]: ")?.as_str() {
-                "1" => {
+            match input
+                .line("Select credential format [1-2, default: 1]: ")?
+                .as_str()
+            {
+                "" | "1" => {
                     return Ok((
                         Some(input.secret_required("Password (stored in profile): ")?),
                         None,
@@ -276,6 +294,11 @@ pub(crate) fn configure_tls_common<R: BufRead>(
         "CA certificate path (absolute; blank disables CA verification): ",
         false,
     )?;
+    if ca_cert.is_none() {
+        eprintln!(
+            "Warning: omitting CA certificate disables server verification (vulnerable to rogue APs)."
+        );
+    }
     let server_domain_mask = if ca_cert.is_some() {
         loop {
             let value =
@@ -309,10 +332,10 @@ pub(crate) fn configure_tls_client_credentials<R: BufRead>(
             "\nTLS client credentials:\n  0) No client certificate\n  1) Separate client certificate and private key\n  2) PKCS#12 client key bundle"
         );
         match input
-            .line("Select client credential form [0-2]: ")?
+            .line("Select client credential form [0-2, default: 0]: ")?
             .as_str()
         {
-            "0" => break TlsClientCredentials::None,
+            "" | "0" => break TlsClientCredentials::None,
             "1" => {
                 let certificate = input
                     .path("Client certificate path (absolute): ", true)?
@@ -382,6 +405,33 @@ mod tests {
                 .expect("select TTLS method"),
             EapMethod::WfaTls
         );
+    }
+
+    #[test]
+    fn method_selection_accepts_case_insensitive_name_aliases() {
+        let mut input = Input::new(Cursor::new(b"peap\n"));
+        assert_eq!(
+            select_method(&mut input, "Outer", EapMethod::OUTER).expect("select PEAP by name"),
+            EapMethod::Peap
+        );
+
+        let mut input = Input::new(Cursor::new(b"TLS\n"));
+        assert_eq!(
+            select_method(&mut input, "Outer", EapMethod::OUTER).expect("select TLS by name"),
+            EapMethod::Tls
+        );
+    }
+
+    #[test]
+    fn interactive_menus_accept_enter_key_for_defaults() {
+        let mut input = Input::new(Cursor::new(b"\n"));
+        assert!(!select_credential_handling(&mut input).expect("default credential handling"));
+
+        let mut input = Input::new(Cursor::new(b"\n"));
+        let (client, passphrase) =
+            configure_tls_client_credentials(&mut input, false).expect("default client creds");
+        assert_eq!(client, TlsClientCredentials::None);
+        assert_eq!(passphrase, None);
     }
 
     fn peap_layer() -> EapLayer {

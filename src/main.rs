@@ -38,7 +38,10 @@ fn run() -> Result<(), AppError> {
         if iweap::model::validate_ssid(&value).is_ok() {
             break value;
         }
-        eprintln!("SSID must contain 1 to {MAX_SSID_BYTES} bytes.");
+        eprintln!(
+            "SSID must contain 1 to {MAX_SSID_BYTES} bytes (got {} bytes).",
+            value.len()
+        );
     };
 
     let (profile, filename, store_credentials) = configure_profile(&mut input, ssid)?;

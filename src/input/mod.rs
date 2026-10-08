@@ -106,21 +106,52 @@ impl<R: BufRead> Input<R> {
 
     pub fn path(&mut self, prompt: &str, required: bool) -> Result<Option<PathBuf>, InputError> {
         loop {
-            let value = if required {
+            let raw_value = if required {
                 self.required(prompt)?
             } else if let Some(value) = self.optional(prompt)? {
                 value
             } else {
                 return Ok(None);
             };
-            let path = PathBuf::from(value);
-            if path.is_absolute() && path.to_str().is_some() {
-                match std::fs::metadata(&path) {
-                    Ok(metadata) if metadata.is_file() => return Ok(Some(path)),
-                    _ => {}
+            let cleaned = sanitize_path_input(&raw_value);
+            if cleaned.is_empty() {
+                if required {
+                    eprintln!("This value is required.");
+                    continue;
+                } else {
+                    return Ok(None);
                 }
             }
-            eprintln!("Path must be absolute and point to an existing regular file.");
+            let path = PathBuf::from(cleaned);
+            if !path.is_absolute() {
+                eprintln!("Path must be absolute (start with /).");
+                continue;
+            }
+            match std::fs::metadata(&path) {
+                Ok(metadata) => {
+                    if metadata.is_file() {
+                        return Ok(Some(path));
+                    } else if metadata.is_dir() {
+                        eprintln!(
+                            "Path is a directory, not a regular file: {}",
+                            path.display()
+                        );
+                    } else {
+                        eprintln!("Path is not a regular file: {}", path.display());
+                    }
+                }
+                Err(error) => match error.kind() {
+                    io::ErrorKind::NotFound => {
+                        eprintln!("File not found: {}", path.display());
+                    }
+                    io::ErrorKind::PermissionDenied => {
+                        eprintln!("Permission denied: {}", path.display());
+                    }
+                    _ => {
+                        eprintln!("Cannot access {}: {error}", path.display());
+                    }
+                },
+            }
         }
     }
 
@@ -156,6 +187,17 @@ pub(crate) fn trim_line_ending(line: &mut String) {
     if line.ends_with('\r') {
         line.pop();
     }
+}
+
+pub(crate) fn sanitize_path_input(input: &str) -> &str {
+    let mut trimmed = input.trim();
+    if trimmed.len() >= 2
+        && ((trimmed.starts_with('"') && trimmed.ends_with('"'))
+            || (trimmed.starts_with('\'') && trimmed.ends_with('\'')))
+    {
+        trimmed = trimmed[1..trimmed.len() - 1].trim();
+    }
+    trimmed
 }
 
 #[cfg(test)]
@@ -199,5 +241,27 @@ mod tests {
 
         let mut trailing_cr = Input::new(Cursor::new(b"trailing_cr\r"));
         assert_eq!(trailing_cr.line("prompt: ").unwrap(), "trailing_cr");
+    }
+
+    #[test]
+    fn path_input_sanitizes_quotes_and_whitespace() {
+        assert_eq!(sanitize_path_input("  /etc/hosts  "), "/etc/hosts");
+        assert_eq!(sanitize_path_input("\"/etc/hosts\""), "/etc/hosts");
+        assert_eq!(sanitize_path_input("'  /etc/hosts  '"), "/etc/hosts");
+        assert_eq!(sanitize_path_input("\"\""), "");
+        assert_eq!(sanitize_path_input(""), "");
+
+        let mut input = Input::new(Cursor::new(b" \"/etc/hosts\" \n"));
+        let path = input.path("path: ", true).unwrap();
+        assert_eq!(path, Some(PathBuf::from("/etc/hosts")));
+    }
+
+    #[test]
+    fn path_input_retries_on_relative_or_missing_paths() {
+        let mut input = Input::new(Cursor::new(
+            b"relative/path\n/missing/nonexistent/file.pem\n/etc/hosts\n",
+        ));
+        let path = input.path("path: ", true).unwrap();
+        assert_eq!(path, Some(PathBuf::from("/etc/hosts")));
     }
 }
