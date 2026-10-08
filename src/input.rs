@@ -60,9 +60,7 @@ impl<R: BufRead> Input<R> {
         if count == 0 {
             return Err(InputError::EndOfInput);
         }
-        if line.ends_with('\n') {
-            line.pop();
-        }
+        trim_line_ending(&mut line);
         Ok(line)
     }
 
@@ -288,6 +286,15 @@ fn setup_error_or_pending_signal(
     }
 }
 
+fn trim_line_ending(line: &mut String) {
+    if line.ends_with('\n') {
+        line.pop();
+    }
+    if line.ends_with('\r') {
+        line.pop();
+    }
+}
+
 fn spawn_secret_reader(
     read_tty: File,
     sender: mpsc::Sender<SecretEvent>,
@@ -302,9 +309,7 @@ fn spawn_secret_reader(
                     "input ended unexpectedly",
                 ));
             }
-            if value.ends_with('\n') {
-                value.pop();
-            }
+            trim_line_ending(&mut value);
             Ok(Secret::new(std::mem::take(&mut *value)))
         });
         let _ = sender.send(SecretEvent::Read(result.and_then(|value| value)));
@@ -573,5 +578,34 @@ mod tests {
         assert!(matches!(result, Err(InputError::Interrupted(s)) if s == SIGTERM));
         assert!(is_echo_enabled(&slave_probe));
         assert!(signals.active_secret.lock().unwrap().is_none());
+    }
+
+    #[test]
+    fn line_reader_and_prompts_strip_crlf_and_cr_endings() {
+        let mut input = Input::new(Cursor::new(
+            b"first\r\n\r\nsecond\r\nthird\nrequired\r\nyes\r\nno\r\n",
+        ));
+        assert_eq!(input.line("first: ").unwrap(), "first");
+        assert_eq!(input.line("empty: ").unwrap(), "");
+        assert_eq!(input.line("second: ").unwrap(), "second");
+        assert_eq!(input.line("third: ").unwrap(), "third");
+        assert_eq!(input.required("required: ").unwrap(), "required");
+        assert!(input.yes_no("yes: ", false).unwrap());
+        assert_eq!(input.optional_bool("no: ").unwrap(), Some(false));
+
+        let mut trailing_cr = Input::new(Cursor::new(b"trailing_cr\r"));
+        assert_eq!(trailing_cr.line("prompt: ").unwrap(), "trailing_cr");
+    }
+
+    #[test]
+    fn secret_reader_strips_crlf_and_cr_endings() {
+        let signals = SignalManager {
+            active_secret: std::sync::Arc::new(std::sync::Mutex::new(None)),
+        };
+        let (mut master, slave) = create_test_pty();
+        master.write_all(b"secret_value\r\n").unwrap();
+
+        let secret = read_secret_from_tty(&signals, slave, spawn_secret_reader).unwrap();
+        assert_eq!(secret.as_str(), "secret_value");
     }
 }
