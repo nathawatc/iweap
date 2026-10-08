@@ -4,15 +4,30 @@ use iweap::model::{MAX_EAP_DEPTH, MethodKind, PASSWORD_HASH_HEX_CHARS};
 use iweap::{
     EapLayer, EapMethod, Profile, Secret, TlsClientCredentials, TlsConfig, ValidationError,
 };
-use std::io::BufRead;
+use std::io::{BufRead, IsTerminal};
 use std::path::PathBuf;
+
+fn is_stderr_tty() -> bool {
+    std::io::stderr().is_terminal()
+}
+
+fn default_method_for(methods: &[EapMethod]) -> Option<EapMethod> {
+    if methods.contains(&EapMethod::Peap) {
+        Some(EapMethod::Peap)
+    } else if methods.contains(&EapMethod::Mschapv2) {
+        Some(EapMethod::Mschapv2)
+    } else if methods.contains(&EapMethod::TunneledPap) {
+        Some(EapMethod::TunneledPap)
+    } else {
+        methods.first().copied()
+    }
+}
 
 pub fn configure_profile<R: BufRead>(
     input: &mut Input<R>,
     ssid: String,
 ) -> Result<(Profile, String, bool), AppError> {
     let filename = iweap::model::profile_filename_for_ssid(&ssid);
-    eprintln!("IWD profile filename: {filename}");
 
     let outer = select_method(input, "Outer EAP method", EapMethod::OUTER)?;
     let store_credentials = if outer.is_sim_method() {
@@ -33,14 +48,34 @@ pub(crate) fn select_method<R: BufRead>(
     title: &str,
     methods: &[EapMethod],
 ) -> Result<EapMethod, AppError> {
+    let default_method = default_method_for(methods);
+    let tty = is_stderr_tty();
     loop {
         eprintln!("\n{title}:");
-        for (index, method) in methods.iter().enumerate() {
-            eprintln!("{:>3}) {}", index + 1, method.name());
+        let items: Vec<String> = methods
+            .iter()
+            .enumerate()
+            .map(|(index, method)| {
+                let is_default = Some(*method) == default_method;
+                if is_default && tty {
+                    format!("\x1b[1m{:>3})\x1b[0m {:<10}", index + 1, method.name())
+                } else {
+                    format!("{:>3}) {:<10}", index + 1, method.name())
+                }
+            })
+            .collect();
+        for chunk in items.chunks(3) {
+            eprintln!("  {}", chunk.join("  "));
         }
-        let prompt = format!("Select method [1-{}]: ", methods.len());
+
+        let prompt = format!("Select [1-{}]: ", methods.len());
         let line = input.line(&prompt)?;
         let trimmed = line.trim();
+        if trimmed.is_empty() {
+            if let Some(default) = default_method {
+                return Ok(default);
+            }
+        }
         if let Ok(selection) = trimmed.parse::<usize>() {
             if let Some(method) = selection
                 .checked_sub(1)
@@ -65,14 +100,13 @@ pub(crate) fn select_method<R: BufRead>(
 pub(crate) fn select_credential_handling<R: BufRead>(
     input: &mut Input<R>,
 ) -> Result<bool, AppError> {
+    let tty = is_stderr_tty();
+    let num_1 = if tty { "\x1b[1m  1)\x1b[0m" } else { "  1)" };
     loop {
         eprintln!(
-            "\nCredential handling:\n  1) Ask IWD agent at connection time (recommended; do not store secrets)\n  2) Store credentials in profile"
+            "\nCredential storage:\n{num_1} Prompt at connection (recommended)\n  2) Store in profile"
         );
-        match input
-            .line("Select credential handling [1-2, default: 1]: ")?
-            .as_str()
-        {
+        match input.line("Select [1-2]: ")?.trim() {
             "" | "1" => return Ok(false),
             "2" => return Ok(true),
             _ => eprintln!("Choose 1 or 2."),
@@ -183,10 +217,12 @@ pub(crate) fn configure_layer<R: BufRead>(
 
     match method {
         EapMethod::Peap => {
+            eprintln!("\n[2/3] Authentication");
             let child = select_inner_eap_method(input, layers, store_credentials)?;
             configure_layer(input, layers, child, depth + 1, false, store_credentials)?;
         }
         EapMethod::Ttls => {
+            eprintln!("\n[2/3] Authentication");
             let child = select_ttls_phase2_method(input, layers, store_credentials)?;
             configure_layer(input, layers, child, depth + 1, false, store_credentials)?;
         }
@@ -204,22 +240,12 @@ pub(crate) fn prompt_identity<R: BufRead>(
     if method.is_sim_method() {
         return Ok(None);
     }
-    let scope = if outer {
-        "Outer identity / anonymous identity"
+    if outer {
+        Ok(input.optional("Anonymous identity [optional]: ")?)
+    } else if method.is_password_method() && store_credentials {
+        Ok(Some(input.required("Username: ")?))
     } else {
-        "Phase-2 identity / username"
-    };
-    let password_method = method.is_password_method();
-    if password_method && store_credentials {
-        Ok(Some(input.required(&format!(
-            "{scope} (required when storing credentials): "
-        ))?))
-    } else if password_method {
-        Ok(input.optional(&format!("{scope} (blank to let IWD ask): "))?)
-    } else {
-        Ok(input.optional(&format!(
-            "{scope} (blank to omit; some RADIUS servers require this): "
-        ))?)
+        Ok(input.optional("Username [optional]: ")?)
     }
 }
 
@@ -232,14 +258,13 @@ pub(crate) fn configure_password<R: BufRead>(
         return Ok((None, None));
     }
     if method == EapMethod::Mschapv2 {
+        let tty = is_stderr_tty();
+        let num_1 = if tty { "\x1b[1m  1)\x1b[0m" } else { "  1)" };
         loop {
             eprintln!(
-                "\nMSCHAPV2 credential format:\n  1) Password (IWD derives the NT hash)\n  2) Existing {PASSWORD_HASH_HEX_CHARS}-hex-character MD4 password hash"
+                "\nMSCHAPV2 credential format:\n{num_1} Password\n  2) MD4 password hash ({PASSWORD_HASH_HEX_CHARS} hex characters)"
             );
-            match input
-                .line("Select credential format [1-2, default: 1]: ")?
-                .as_str()
-            {
+            match input.line("Select [1-2]: ")?.trim() {
                 "" | "1" => {
                     return Ok((
                         Some(input.secret_required("Password (stored in profile): ")?),
@@ -271,12 +296,12 @@ pub(crate) fn configure_tunneled_fields<R: BufRead>(
     store_credentials: bool,
 ) -> Result<(), AppError> {
     layer.identity = if store_credentials {
-        Some(input.required("Phase-2 identity / username: ")?)
+        Some(input.required("Username: ")?)
     } else {
-        input.optional("Phase-2 identity / username (blank to let IWD ask): ")?
+        input.optional("Username [optional]: ")?
     };
     if store_credentials {
-        layer.password = Some(input.secret_required("Phase-2 password (stored in profile): ")?);
+        layer.password = Some(input.secret_required("Password (stored in profile): ")?);
     }
     Ok(())
 }
@@ -290,10 +315,7 @@ pub(crate) struct TlsCommon {
 pub(crate) fn configure_tls_common<R: BufRead>(
     input: &mut Input<R>,
 ) -> Result<TlsCommon, AppError> {
-    let ca_cert = input.path(
-        "CA certificate path (absolute; blank disables CA verification): ",
-        false,
-    )?;
+    let ca_cert = input.path("CA certificate path [optional]: ", false)?;
     if ca_cert.is_none() {
         eprintln!(
             "Warning: omitting CA certificate disables server verification (vulnerable to rogue APs)."
@@ -301,8 +323,7 @@ pub(crate) fn configure_tls_common<R: BufRead>(
     }
     let server_domain_mask = if ca_cert.is_some() {
         loop {
-            let value =
-                input.optional("Server domain mask (blank to omit; use ; between masks): ")?;
+            let value = input.optional("Server domain mask [optional]: ")?;
             match value {
                 None => break None,
                 Some(value) if iweap::model::is_valid_domain_mask(&value) => break Some(value),
@@ -315,7 +336,7 @@ pub(crate) fn configure_tls_common<R: BufRead>(
         None
     };
     let fast_reauthentication =
-        input.optional_bool("Fast reauthentication [y/n/blank to omit]: ")?;
+        input.optional_bool("Fast reauthentication [y/n, blank to omit]: ")?;
     Ok(TlsCommon {
         ca_cert,
         server_domain_mask,
@@ -327,42 +348,39 @@ pub(crate) fn configure_tls_client_credentials<R: BufRead>(
     input: &mut Input<R>,
     store_credentials: bool,
 ) -> Result<(TlsClientCredentials, Option<Secret>), AppError> {
+    let tty = is_stderr_tty();
+    let num_0 = if tty { "\x1b[1m  0)\x1b[0m" } else { "  0)" };
     let client = loop {
         eprintln!(
-            "\nTLS client credentials:\n  0) No client certificate\n  1) Separate client certificate and private key\n  2) PKCS#12 client key bundle"
+            "\nTLS client credentials:\n{num_0} None\n  1) Certificate & private key\n  2) PKCS#12 bundle"
         );
-        match input
-            .line("Select client credential form [0-2, default: 0]: ")?
-            .as_str()
-        {
+        match input.line("Select [0-2]: ")?.trim() {
             "" | "0" => break TlsClientCredentials::None,
             "1" => {
                 let certificate = input
-                    .path("Client certificate path (absolute): ", true)?
+                    .path("Client certificate path: ", true)?
                     .ok_or(ValidationError::InvalidPath)?;
                 let key = input
-                    .path("Private key path (absolute): ", true)?
+                    .path("Private key path: ", true)?
                     .ok_or(ValidationError::InvalidPath)?;
                 break TlsClientCredentials::CertificateAndKey { certificate, key };
             }
             "2" => {
                 let bundle = input
-                    .path("PKCS#12 client key bundle path (absolute): ", true)?
+                    .path("PKCS#12 bundle path: ", true)?
                     .ok_or(ValidationError::InvalidPath)?;
                 break TlsClientCredentials::Pkcs12 { bundle };
             }
             _ => eprintln!("Choose 0, 1, or 2."),
         }
     };
-    let client_key_passphrase = if store_credentials
-        && !matches!(client, TlsClientCredentials::None)
-    {
-        let value = input
-            .secret("Private-key passphrase (blank to let IWD ask or for an unencrypted key): ")?;
-        (!value.is_empty()).then_some(value)
-    } else {
-        None
-    };
+    let client_key_passphrase =
+        if store_credentials && !matches!(client, TlsClientCredentials::None) {
+            let value = input.secret("Private key passphrase [optional]: ")?;
+            (!value.is_empty()).then_some(value)
+        } else {
+            None
+        };
     Ok((client, client_key_passphrase))
 }
 

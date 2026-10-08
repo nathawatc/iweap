@@ -33,6 +33,7 @@ fn run() -> Result<(), AppError> {
     let stdin = io::stdin();
     let mut input = Input::with_signals(stdin.lock(), signals);
 
+    eprintln!("[1/3] Network & Tunnel");
     let ssid = loop {
         let value = input.required("SSID: ")?;
         if iweap::model::validate_ssid(&value).is_ok() {
@@ -45,6 +46,7 @@ fn run() -> Result<(), AppError> {
     };
 
     let (profile, filename, store_credentials) = configure_profile(&mut input, ssid)?;
+    eprintln!("\n[3/3] Review & Install");
     show_preview(&profile, &filename, store_credentials)?;
 
     if options.dry_run {
