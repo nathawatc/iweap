@@ -10,7 +10,7 @@ use std::io::{self, BufRead};
 
 fn usage() -> String {
     format!(
-        "Usage: iweap [--dry-run|--preview] [--help]\n\nInteractively create an IWD .8021x profile for {IWD_DIRECTORY}/.\n\nOptions:\n  --dry-run, --preview  Generate and display a redacted profile; do not install it.\n  --help                Show this help.\n\nThe unprivileged client sends typed requests over the system D-Bus. The root\nservice performs direct Polkit authorization and writes only {IWD_DIRECTORY}.\nCredentials are omitted by default so IWD can request them through its agent.\n"
+        "Usage: iweap [--dry-run|--preview] [-h|--help] [-V|--version]\n\nInteractively create an IWD .8021x profile for {IWD_DIRECTORY}/.\n\nOptions:\n  --dry-run, --preview  Generate and display a redacted profile; do not install it.\n  -h, --help            Show this help.\n  -V, --version         Show version information.\n\nThe unprivileged client sends typed requests over the system D-Bus. The root\nservice performs direct Polkit authorization and writes only {IWD_DIRECTORY}.\nCredentials are omitted by default so IWD can request them through its agent.\n"
     )
 }
 
@@ -19,6 +19,7 @@ enum AppError {
     Input(InputError),
     Validation(ValidationError),
     Bus(zbus::Error),
+    UnknownOption(String),
 }
 
 impl std::fmt::Display for AppError {
@@ -27,6 +28,12 @@ impl std::fmt::Display for AppError {
             Self::Input(error) => error.fmt(f),
             Self::Validation(error) => error.fmt(f),
             Self::Bus(error) => write!(f, "D-Bus request failed: {error}"),
+            Self::UnknownOption(option) => {
+                write!(
+                    f,
+                    "unrecognized option '{option}'\nTry 'iweap --help' for more information."
+                )
+            }
         }
     }
 }
@@ -51,19 +58,26 @@ impl From<zbus::Error> for AppError {
     }
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 struct Options {
     dry_run: bool,
 }
 
 fn main() {
     if let Err(error) = run() {
-        let exit_code = match &error {
-            AppError::Input(InputError::Interrupted(signal)) => 128 + signal,
-            _ => 1,
-        };
-        eprintln!("iweap: {error}");
-        std::process::exit(exit_code);
+        match &error {
+            AppError::Input(InputError::Interrupted(signal)) => {
+                std::process::exit(128 + signal);
+            }
+            AppError::UnknownOption(_) => {
+                eprintln!("iweap: {error}");
+                std::process::exit(2);
+            }
+            _ => {
+                eprintln!("iweap: {error}");
+                std::process::exit(1);
+            }
+        }
     }
 }
 
@@ -104,6 +118,7 @@ fn run() -> Result<(), AppError> {
 
     let install_prompt = format!("Install this profile into {IWD_DIRECTORY}? [y/N]: ");
     if !input.yes_no(&install_prompt, false)? {
+        eprintln!("Installation aborted.");
         return Ok(());
     }
 
@@ -117,6 +132,7 @@ fn run() -> Result<(), AppError> {
         false
     };
     if inspection.state.exists && !overwrite {
+        eprintln!("Existing profile left unmodified; installation aborted.");
         return Ok(());
     }
 
@@ -137,16 +153,16 @@ fn parse_args(arguments: impl IntoIterator<Item = String>) -> Result<Option<Opti
     for argument in arguments {
         match argument.as_str() {
             "--dry-run" | "--preview" => dry_run = true,
-            "--help" | "-h" => {
+            "-h" | "--help" => {
                 print!("{}", usage());
                 return Ok(None);
             }
+            "-V" | "--version" => {
+                println!("iweap {}", env!("CARGO_PKG_VERSION"));
+                return Ok(None);
+            }
             _ => {
-                eprint!("{}", usage());
-                return Err(AppError::Input(InputError::Io(io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    "unknown option",
-                ))));
+                return Err(AppError::UnknownOption(argument));
             }
         }
     }
@@ -521,11 +537,30 @@ mod tests {
                 .expect("help argument")
                 .is_none()
         );
-        assert!(matches!(
-            parse_args([String::from("--unknown")]),
-            Err(AppError::Input(InputError::Io(error)))
-                if error.kind() == io::ErrorKind::InvalidInput
-        ));
+        assert!(
+            parse_args([String::from("-h")])
+                .expect("short help argument")
+                .is_none()
+        );
+        assert!(
+            parse_args([String::from("--version")])
+                .expect("version argument")
+                .is_none()
+        );
+        assert!(
+            parse_args([String::from("-V")])
+                .expect("short version argument")
+                .is_none()
+        );
+        let err = parse_args([String::from("--unknown")]).expect_err("unknown option");
+        assert!(matches!(err, AppError::UnknownOption(ref opt) if opt == "--unknown"));
+        assert_eq!(
+            err.to_string(),
+            "unrecognized option '--unknown'\nTry 'iweap --help' for more information."
+        );
+        let help_text = usage();
+        assert!(help_text.contains("-h, --help"));
+        assert!(help_text.contains("-V, --version"));
     }
 
     #[test]
