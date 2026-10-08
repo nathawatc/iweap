@@ -11,25 +11,18 @@ fn is_stderr_tty() -> bool {
     std::io::stderr().is_terminal()
 }
 
-fn default_method_for(methods: &[EapMethod]) -> Option<EapMethod> {
-    if methods.contains(&EapMethod::Peap) {
-        Some(EapMethod::Peap)
-    } else if methods.contains(&EapMethod::Mschapv2) {
-        Some(EapMethod::Mschapv2)
-    } else if methods.contains(&EapMethod::TunneledPap) {
-        Some(EapMethod::TunneledPap)
-    } else {
-        methods.first().copied()
-    }
-}
-
 pub fn configure_profile<R: BufRead>(
     input: &mut Input<R>,
     ssid: String,
 ) -> Result<(Profile, String, bool), AppError> {
     let filename = iweap::model::profile_filename_for_ssid(&ssid);
 
-    let outer = select_method(input, "Outer EAP method", EapMethod::OUTER)?;
+    let outer = select_method(
+        input,
+        "Outer EAP method",
+        EapMethod::OUTER,
+        Some(EapMethod::Peap),
+    )?;
     let store_credentials = if outer.is_sim_method() {
         false
     } else {
@@ -47,8 +40,9 @@ pub(crate) fn select_method<R: BufRead>(
     input: &mut Input<R>,
     title: &str,
     methods: &[EapMethod],
+    default_method: Option<EapMethod>,
 ) -> Result<EapMethod, AppError> {
-    let default_method = default_method_for(methods);
+    let default_method = default_method.filter(|d| methods.contains(d));
     let tty = is_stderr_tty();
     loop {
         eprintln!("\n{title}:");
@@ -120,6 +114,7 @@ pub(crate) fn select_compatible_method<R: BufRead>(
     methods: impl IntoIterator<Item = EapMethod>,
     existing_layers: &[EapLayer],
     store_credentials: bool,
+    default_method: Option<EapMethod>,
 ) -> Result<EapMethod, AppError> {
     let methods: Vec<EapMethod> = methods
         .into_iter()
@@ -134,7 +129,7 @@ pub(crate) fn select_compatible_method<R: BufRead>(
     if methods.is_empty() {
         return Err(ValidationError::SettingPrefixTooLong.into());
     }
-    select_method(input, title, &methods)
+    select_method(input, title, &methods, default_method)
 }
 
 pub(crate) fn select_inner_eap_method<R: BufRead>(
@@ -148,6 +143,7 @@ pub(crate) fn select_inner_eap_method<R: BufRead>(
         EapMethod::INNER.iter().copied(),
         existing_layers,
         store_credentials,
+        Some(EapMethod::Mschapv2),
     )
 }
 
@@ -162,6 +158,7 @@ pub(crate) fn select_ttls_phase2_method<R: BufRead>(
         EapMethod::TTLS_PHASE2.iter().copied(),
         existing_layers,
         store_credentials,
+        Some(EapMethod::TunneledMschapv2),
     )
 }
 
@@ -244,8 +241,10 @@ pub(crate) fn prompt_identity<R: BufRead>(
         Ok(input.optional("Anonymous identity [optional]: ")?)
     } else if method.is_password_method() && store_credentials {
         Ok(Some(input.required("Username: ")?))
-    } else {
+    } else if method.is_password_method() {
         Ok(input.optional("Username [optional]: ")?)
+    } else {
+        Ok(input.optional("Phase-2 anonymous identity [optional]: ")?)
     }
 }
 
@@ -413,7 +412,7 @@ mod tests {
     fn method_selection_uses_model_catalog_order_and_bounds() {
         let mut input = Input::new(Cursor::new(b"0\ninvalid\n9\n"));
         assert_eq!(
-            select_method(&mut input, "Outer", EapMethod::OUTER).expect("select method"),
+            select_method(&mut input, "Outer", EapMethod::OUTER, None).expect("select method"),
             EapMethod::WfaTls
         );
 
@@ -429,19 +428,34 @@ mod tests {
     fn method_selection_accepts_case_insensitive_name_aliases() {
         let mut input = Input::new(Cursor::new(b"peap\n"));
         assert_eq!(
-            select_method(&mut input, "Outer", EapMethod::OUTER).expect("select PEAP by name"),
+            select_method(&mut input, "Outer", EapMethod::OUTER, None)
+                .expect("select PEAP by name"),
             EapMethod::Peap
         );
 
         let mut input = Input::new(Cursor::new(b"TLS\n"));
         assert_eq!(
-            select_method(&mut input, "Outer", EapMethod::OUTER).expect("select TLS by name"),
+            select_method(&mut input, "Outer", EapMethod::OUTER, None).expect("select TLS by name"),
             EapMethod::Tls
         );
     }
 
     #[test]
     fn interactive_menus_accept_enter_key_for_defaults() {
+        let mut input = Input::new(Cursor::new(b"\n"));
+        assert_eq!(
+            select_method(&mut input, "Outer", EapMethod::OUTER, Some(EapMethod::Peap))
+                .expect("default PEAP"),
+            EapMethod::Peap
+        );
+
+        let mut input = Input::new(Cursor::new(b"\n"));
+        assert_eq!(
+            select_inner_eap_method(&mut input, &[EapLayer::new(EapMethod::Peap)], true)
+                .expect("default MSCHAPV2 for inner PEAP"),
+            EapMethod::Mschapv2
+        );
+
         let mut input = Input::new(Cursor::new(b"\n"));
         assert!(!select_credential_handling(&mut input).expect("default credential handling"));
 
@@ -450,6 +464,31 @@ mod tests {
             configure_tls_client_credentials(&mut input, false).expect("default client creds");
         assert_eq!(client, TlsClientCredentials::None);
         assert_eq!(passphrase, None);
+    }
+
+    #[test]
+    fn enterprise_peap_mschapv2_flow_uses_defaults_for_outer_inner_and_format() {
+        // 1. \n -> outer method: default PEAP
+        // 2. \n -> credential storage: default Prompt at connection
+        // 3. \n -> anonymous identity: omitted
+        // 4. \n -> CA cert: omitted
+        // 5. \n -> fast reauth: omitted
+        // 6. \n -> inner method: default MSCHAPV2
+        // 7. \n -> username: omitted (deferred to agent)
+        let input_bytes = b"\n\n\n\n\n\n\n";
+        let mut cursor = Cursor::new(&input_bytes[..]);
+        let mut input = Input::new(&mut cursor);
+
+        let (profile, filename, store_credentials) =
+            configure_profile(&mut input, String::from("@KMUTNB"))
+                .expect("configure enterprise profile");
+
+        assert!(!store_credentials);
+        assert_eq!(filename, "=404b4d55544e42.8021x");
+        assert_eq!(profile.layers.len(), 2);
+        assert_eq!(profile.layers[0].method, EapMethod::Peap);
+        assert_eq!(profile.layers[1].method, EapMethod::Mschapv2);
+        assert_eq!(profile.layers[1].identity, None);
     }
 
     fn peap_layer() -> EapLayer {
