@@ -6,13 +6,13 @@ pub fn show_preview(
     filename: &str,
     store_credentials: bool,
 ) -> Result<(), AppError> {
-    println!("\nProfile filename: {filename}");
-    println!("Install path: {IWD_DIRECTORY}/{filename}\n");
+    eprintln!("\nProfile filename: {filename}");
+    eprintln!("Install path: {IWD_DIRECTORY}/{filename}\n");
     print!("{}", profile.redacted_config()?);
     if store_credentials {
-        println!("\nStored secrets are shown as <redacted>.");
+        eprintln!("\nStored secrets are shown as <redacted>.");
     } else {
-        println!(
+        eprintln!(
             "\nCredentials are not stored in this profile.\nIWD will obtain any required credentials at connection time."
         );
     }

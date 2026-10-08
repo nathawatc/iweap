@@ -1,6 +1,26 @@
 use crate::model::{InstallRequest, ProfileInspection};
 use std::collections::HashMap;
+use std::sync::Mutex;
 use zbus::zvariant::{OwnedValue, Str};
+
+static SYSTEM_BUS_CONNECTION: Mutex<Option<zbus::Connection>> = Mutex::new(None);
+
+pub async fn system_bus_connection() -> Result<zbus::Connection, AuthorizationError> {
+    if let Ok(lock) = SYSTEM_BUS_CONNECTION.lock() {
+        if let Some(ref conn) = *lock {
+            if !conn.is_closed() {
+                return Ok(conn.clone());
+            }
+        }
+    }
+    let conn = zbus::Connection::system()
+        .await
+        .map_err(AuthorizationError::Bus)?;
+    if let Ok(mut lock) = SYSTEM_BUS_CONNECTION.lock() {
+        *lock = Some(conn.clone());
+    }
+    Ok(conn)
+}
 
 pub const SERVICE_NAME: &str = "org.codeberg.iweap";
 pub const OBJECT_PATH: &str = "/org/codeberg/iweap";
@@ -55,9 +75,7 @@ impl std::fmt::Display for AuthorizationError {
 impl std::error::Error for AuthorizationError {}
 
 pub async fn authorize_system_bus_name(sender: &str) -> Result<(), AuthorizationError> {
-    let connection = zbus::Connection::system()
-        .await
-        .map_err(AuthorizationError::Bus)?;
+    let connection = system_bus_connection().await?;
     let proxy = PolicyKitAuthorityProxy::new(&connection)
         .await
         .map_err(AuthorizationError::Bus)?;

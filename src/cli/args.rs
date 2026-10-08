@@ -20,7 +20,7 @@ impl std::fmt::Display for AppError {
         match self {
             Self::Input(error) => error.fmt(f),
             Self::Validation(error) => error.fmt(f),
-            Self::Bus(error) => write!(f, "D-Bus request failed: {error}"),
+            Self::Bus(error) => format_bus_error(error, f),
             Self::UnknownOption(option) => {
                 write!(
                     f,
@@ -29,6 +29,67 @@ impl std::fmt::Display for AppError {
             }
         }
     }
+}
+
+fn format_bus_error(error: &zbus::Error, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    if let zbus::Error::FDO(fdo_err) = error {
+        match fdo_err.as_ref() {
+            zbus::fdo::Error::AccessDenied(_) => {
+                return write!(f, "authorization denied or cancelled by user");
+            }
+            zbus::fdo::Error::ServiceUnknown(_) | zbus::fdo::Error::NameHasNoOwner(_) => {
+                return write!(
+                    f,
+                    "installer service unavailable; verify systemd and D-Bus activation"
+                );
+            }
+            zbus::fdo::Error::Timeout(_) => {
+                return write!(
+                    f,
+                    "request timed out waiting for installer service or authentication"
+                );
+            }
+            zbus::fdo::Error::InvalidArgs(detail) => {
+                return write!(f, "invalid request: {detail}");
+            }
+            zbus::fdo::Error::Failed(detail) => {
+                return write!(f, "installation failed: {detail}");
+            }
+            _ => {}
+        }
+    }
+    if let zbus::Error::MethodError(name, detail, _) = error {
+        match name.as_str() {
+            "org.freedesktop.DBus.Error.AccessDenied" => {
+                return write!(f, "authorization denied or cancelled by user");
+            }
+            "org.freedesktop.DBus.Error.ServiceUnknown"
+            | "org.freedesktop.DBus.Error.NameHasNoOwner" => {
+                return write!(
+                    f,
+                    "installer service unavailable; verify systemd and D-Bus activation"
+                );
+            }
+            "org.freedesktop.DBus.Error.NoReply" | "org.freedesktop.DBus.Error.Timeout" => {
+                return write!(
+                    f,
+                    "request timed out waiting for installer service or authentication"
+                );
+            }
+            "org.freedesktop.DBus.Error.InvalidArgs" => {
+                if let Some(detail) = detail {
+                    return write!(f, "invalid request: {detail}");
+                }
+            }
+            "org.freedesktop.DBus.Error.Failed" => {
+                if let Some(detail) = detail {
+                    return write!(f, "installation failed: {detail}");
+                }
+            }
+            _ => {}
+        }
+    }
+    write!(f, "D-Bus request failed: {error}")
 }
 
 impl std::error::Error for AppError {}
@@ -118,5 +179,40 @@ mod tests {
         let help_text = usage();
         assert!(help_text.contains("-h, --help"));
         assert!(help_text.contains("-V, --version"));
+    }
+
+    #[test]
+    fn bus_error_formatting_translates_known_dbus_errors() {
+        let access_denied = AppError::from(zbus::Error::from(zbus::fdo::Error::AccessDenied(
+            String::new(),
+        )));
+        assert_eq!(
+            access_denied.to_string(),
+            "authorization denied or cancelled by user"
+        );
+
+        let service_unknown = AppError::from(zbus::Error::from(zbus::fdo::Error::ServiceUnknown(
+            String::new(),
+        )));
+        assert_eq!(
+            service_unknown.to_string(),
+            "installer service unavailable; verify systemd and D-Bus activation"
+        );
+
+        let timeout = AppError::from(zbus::Error::from(zbus::fdo::Error::Timeout(String::new())));
+        assert_eq!(
+            timeout.to_string(),
+            "request timed out waiting for installer service or authentication"
+        );
+
+        let invalid = AppError::from(zbus::Error::from(zbus::fdo::Error::InvalidArgs(
+            String::from("bad ssid"),
+        )));
+        assert_eq!(invalid.to_string(), "invalid request: bad ssid");
+
+        let failed = AppError::from(zbus::Error::from(zbus::fdo::Error::Failed(String::from(
+            "disk full",
+        ))));
+        assert_eq!(failed.to_string(), "installation failed: disk full");
     }
 }
