@@ -115,12 +115,44 @@ impl EapMethod {
         Self::TunneledMschap,
         Self::TunneledMschapv2,
     ];
+    pub const TTLS_PHASE2: &'static [Self] = &[
+        Self::TunneledPap,
+        Self::TunneledChap,
+        Self::TunneledMschap,
+        Self::TunneledMschapv2,
+        Self::Gtc,
+        Self::Md5,
+        Self::Mschapv2,
+        Self::Pwd,
+        Self::Aka,
+        Self::AkaPrime,
+        Self::Peap,
+        Self::Sim,
+        Self::Tls,
+        Self::Ttls,
+        Self::WfaTls,
+    ];
+    pub const ALL: &'static [Self] = &[
+        Self::Aka,
+        Self::AkaPrime,
+        Self::Mschapv2,
+        Self::Peap,
+        Self::Pwd,
+        Self::Sim,
+        Self::Tls,
+        Self::Ttls,
+        Self::WfaTls,
+        Self::Gtc,
+        Self::Md5,
+        Self::TunneledPap,
+        Self::TunneledChap,
+        Self::TunneledMschap,
+        Self::TunneledMschapv2,
+    ];
 
     pub fn from_wire(value: u8) -> Option<Self> {
-        Self::OUTER
+        Self::ALL
             .iter()
-            .chain(Self::INNER)
-            .chain(Self::TTLS_TUNNELED)
             .copied()
             .find(|method| method.wire_code() == value)
     }
@@ -300,6 +332,12 @@ mod tests {
                 EapMethod::TunneledMschapv2,
             ]
         );
+        let expected_ttls_phase2: Vec<EapMethod> = EapMethod::TTLS_TUNNELED
+            .iter()
+            .chain(EapMethod::INNER)
+            .copied()
+            .collect();
+        assert_eq!(EapMethod::TTLS_PHASE2, expected_ttls_phase2.as_slice());
 
         let methods = [
             EapMethod::Aka,
@@ -318,6 +356,7 @@ mod tests {
             EapMethod::TunneledMschap,
             EapMethod::TunneledMschapv2,
         ];
+        assert_eq!(EapMethod::ALL, &methods);
         for (index, method) in methods.into_iter().enumerate() {
             assert!(!method.name().is_empty());
             assert_eq!(EapMethod::from_wire(method.wire_code()), Some(method));
